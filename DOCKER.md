@@ -1,4 +1,4 @@
-# Docker deployment
+# Dashcam Diary — Docker deployment
 
 Install Docker Desktop on the server computer, then run this command from the
 repository root:

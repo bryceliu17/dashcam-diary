@@ -174,6 +174,21 @@ function SourceSelect({ recording, devices, disabled, onChange }) {
   </select>
 }
 
+function RecordingNoteEditor({ editor, saving, onClose, onSave }) {
+  const [note, setNote] = useState(editor.initialNote)
+  const count = editor.ids.length
+  const title = count === 1 ? `Note · ${editor.filename}` : `Set note for ${count} selected ${editor.type === 'video' ? 'videos' : 'audio recordings'}`
+
+  return <div className="modal" onMouseDown={() => { if (!saving) onClose() }}>
+    <form className="note-editor" onMouseDown={event => event.stopPropagation()} onSubmit={event => { event.preventDefault(); onSave(note) }}>
+      <div><strong>{title}</strong><button type="button" className="close-player" aria-label="Close note editor" disabled={saving} onClick={onClose}>X</button></div>
+      {count > 1 && <p>This replaces the note on every selected file.</p>}
+      <textarea autoFocus maxLength="4000" value={note} onChange={event => setNote(event.target.value)} placeholder="Write a note…" aria-label="Recording note" />
+      <footer><small>{note.length}/4000</small><button type="button" disabled={saving} onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? 'Saving…' : count === 1 ? 'Save note' : 'Set note'}</button></footer>
+    </form>
+  </div>
+}
+
 const supportedMigrationPath = path => {
   const normalized = path.toLowerCase()
   return normalized === 'dashcam.db' || normalized === 'dashcam.db-wal' || normalized === 'dashcam.db-shm' ||
@@ -235,6 +250,7 @@ function Icon({ name }) {
     fullscreen: <><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></>,
     fullscreenExit: <><path d="M3 8h5V3M21 8h-5V3M3 16h5v5M21 16h-5v5"/></>,
     calendar: <><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18"/></>,
+    note: <><path d="M5 3h11l3 3v15H5z"/><path d="M16 3v4h4M8 11h8M8 15h6"/></>,
     transcript: <><path d="M6 3h9l3 3v15H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></>,
     close: <path d="M6 6l12 12M18 6 6 18"/>,
     chevronLeft: <path d="m15 18-6-6 6-6"/>,
@@ -1805,6 +1821,8 @@ export default function App() {
   const [selectedAudio, setSelectedAudio] = useState(null)
   const [selectedAudioSession, setSelectedAudioSession] = useState(null)
   const [selectedTranscript, setSelectedTranscript] = useState(null)
+  const [noteEditor, setNoteEditor] = useState(null)
+  const [noteSaving, setNoteSaving] = useState(false)
   const [liveDeviceId, setLiveDeviceId] = useState(null)
   const [remoteDeviceId, setRemoteDeviceId] = useState(null)
   const [batteryHistory, setBatteryHistory] = useState(null)
@@ -2228,6 +2246,44 @@ export default function App() {
     } catch (err) { setError(err.message) }
   }
 
+  const openNoteEditor = (type, recordings) => {
+    const items = Array.isArray(recordings) ? recordings : [recordings]
+    if (!items.length) return
+    setNoteEditor({
+      type,
+      ids: items.map(item => item.id),
+      initialNote: items.length === 1 ? (items[0].note || '') : '',
+      filename: items.length === 1 ? (items[0].originalFilename || items[0].filename) : '',
+    })
+  }
+
+  const saveRecordingNote = async note => {
+    if (!noteEditor) return
+    const { type, ids } = noteEditor
+    const route = type === 'video' ? 'videos' : 'audio'
+    setNoteSaving(true)
+    setError('')
+    try {
+      const result = await api(ids.length === 1 ? `/api/${route}/${ids[0]}/note` : `/api/${route}/bulk/note`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ids.length === 1 ? { note } : { ids, note }),
+      })
+      const updates = new Map((ids.length === 1 ? [result] : result.items).map(item => [item.id, item]))
+      if (type === 'video') {
+        setVideos(items => items.map(item => updates.get(item.id) || item))
+        setSelected(current => current && (updates.get(current.id) || current))
+        setSelectedSession(current => current ? { ...current, videos: current.videos.map(item => updates.get(item.id) || item) } : current)
+      } else {
+        setAudio(items => items.map(item => updates.get(item.id) || item))
+        setSelectedAudio(current => current && (updates.get(current.id) || current))
+        setSelectedAudioSession(current => current ? { ...current, recordings: current.recordings.map(item => updates.get(item.id) || item) } : current)
+      }
+      setNoteEditor(null)
+      if (result.notFoundIds?.length) setError(`${result.notFoundIds.length} selected item(s) no longer exist.`)
+    } catch (err) { setError(err.message) }
+    finally { setNoteSaving(false) }
+  }
+
   const updateRecordingSource = async (type, recording, source) => {
     const key = `${type}:${recording.id}`
     setSourceSavingIds(current => new Set(current).add(key))
@@ -2578,7 +2634,7 @@ export default function App() {
 
   return <div className="shell">
     <header>
-      <div className="brand"><span className="brand-mark">DC</span><div><strong>Dashcam Archive</strong><small>Local video and audio library</small></div></div>
+      <div className="brand"><span className="brand-mark">DD</span><div><strong>Dashcam Diary</strong><small>Local video and audio library</small></div></div>
       <div className={`status ${online === true ? 'online' : online === false ? 'offline' : ''}`}>
         <span /> {online === true ? 'Server online' : online === false ? 'Server offline' : 'Checking server'}
       </div>
@@ -2586,7 +2642,7 @@ export default function App() {
 
     <main>
       <section className="hero">
-        <div><p className="eyebrow">LOCAL STORAGE</p><h1>Your dashcam archive.</h1><p>Browse, protect, and manage recordings uploaded from your phone.</p></div>
+        <div><p className="eyebrow">LOCAL STORAGE</p><h1>Your Dashcam Diary.</h1><p>Browse, protect, and manage recordings uploaded from your phone.</p></div>
         <button className="refresh" onClick={refresh} disabled={loading}><Icon name="refresh" />Refresh</button>
       </section>
 
@@ -2670,7 +2726,7 @@ export default function App() {
 
       <section className="devices">
         <div className="section-head">
-          <div><p className="eyebrow">CONNECTED DEVICES</p><h2>Dashcam phones</h2></div>
+          <div><p className="eyebrow">CONNECTED DEVICES</p><h2>Dashcam Diary phones</h2></div>
           <span className="device-count">{devices.filter(device => device.online).length} online / {devices.length} known</span>
         </div>
         <div className="device-table-wrap">
@@ -2760,25 +2816,27 @@ export default function App() {
             })}
             title="Download this session as one audio file"
           ><Icon name="download" />{audioExport?.key === 'audio-session-download' ? 'Preparing…' : 'Download session'}</button>}
+          <button onClick={() => openNoteEditor(archiveType, (archiveType === 'video' ? videos : audio).filter(item => selectedIds.has(item.id)))} disabled={bulkBusy}><Icon name="note" />Set note</button>
           <button onClick={() => bulkLock(archiveType, true)} disabled={bulkBusy}><Icon name="lock" />Lock</button>
           <button onClick={() => bulkLock(archiveType, false)} disabled={bulkBusy}><Icon name="unlock" />Unlock</button>
           <button className="danger" onClick={() => bulkRemove(archiveType)} disabled={bulkBusy}><Icon name="trash" />Delete</button>
           <button className="clear-selection" onClick={() => setSelectedIds(new Set())} disabled={bulkBusy}>Clear</button>
         </div>}
 
-        {archiveType === 'video' ? <div className="table-wrap"><table><thead><tr><th className="select-cell"><input type="checkbox" checked={allVisibleSelected} onChange={() => toggleAll(videos, selectedVideoIds, setSelectedVideoIds)} aria-label="Select all visible videos" /></th><th>Recorded</th><th>File</th><th>Source</th><th>Duration</th><th>Size</th><th>Rotation</th><th>Status</th><th>Actions</th></tr></thead>
+        {archiveType === 'video' ? <div className="table-wrap"><table><thead><tr><th className="select-cell"><input type="checkbox" checked={allVisibleSelected} onChange={() => toggleAll(videos, selectedVideoIds, setSelectedVideoIds)} aria-label="Select all visible videos" /></th><th>Recorded</th><th>File</th><th>Source</th><th>Note</th><th>Duration</th><th>Size</th><th>Rotation</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>{videos.flatMap((video, index) => {
             const rows = []
             const sessionStart = videoSessions.starts.get(index)
             const sessionEnd = videoSessions.ends.get(index)
             if (groupVideoSessions && sessionStart) rows.push(
-              <tr className="session-header" key={`session-header-${video.id}`}><td colSpan="9"><div><span><SessionSelectionCheckbox items={sessionStart.videos} selectedIds={selectedVideoIds} setSelectedIds={setSelectedVideoIds} label={`Select all videos in session ${sessionStart.number}`} /><strong>Session {sessionStart.number}</strong><small>{sessionStart.count} {sessionStart.count === 1 ? 'video' : 'videos'} · {sessionStart.videos[0]?.sourceDeviceName || 'No source'}</small></span><button type="button" onClick={() => setSelectedSession(sessionStart)}><Icon name="play" />Play session</button></div></td></tr>
+              <tr className="session-header" key={`session-header-${video.id}`}><td colSpan="10"><div><span><SessionSelectionCheckbox items={sessionStart.videos} selectedIds={selectedVideoIds} setSelectedIds={setSelectedVideoIds} label={`Select all videos in session ${sessionStart.number}`} /><strong>Session {sessionStart.number}</strong><small>{sessionStart.count} {sessionStart.count === 1 ? 'video' : 'videos'} · {sessionStart.videos[0]?.sourceDeviceName || 'No source'}</small></span><button type="button" onClick={() => setSelectedSession(sessionStart)}><Icon name="play" />Play session</button></div></td></tr>
             )
             rows.push(<tr className={groupVideoSessions ? 'video-row grouped' : 'video-row'} key={video.id}>
               <td className="select-cell"><input type="checkbox" checked={selectedVideoIds.has(video.id)} onChange={() => toggleSelection(setSelectedVideoIds, video.id)} aria-label={`Select ${video.originalFilename || video.filename}`} /></td>
               <td>{formatDate(video.startTime)}</td>
               <td className="file"><span>{video.originalFilename || video.filename}</span><small>#{video.id}</small></td>
               <td><SourceSelect recording={video} devices={devices} disabled={sourceSavingIds.has(`videos:${video.id}`)} onChange={source => updateRecordingSource('videos', video, source)} /></td>
+              <td><button className={`note-preview ${video.note ? 'has-note' : ''}`} onClick={() => openNoteEditor('video', video)} title={video.note || 'Add note'}>{video.note || 'Add note'}</button></td>
               <td>{formatDuration(video.durationSeconds)}</td><td>{formatBytes(video.fileSizeBytes)}</td>
               <td>{video.playbackRotationDegrees || 0} deg</td>
               <td><span className={`pill ${video.locked ? 'locked' : ''}`}>{video.locked ? 'Locked' : 'Unlocked'}</span></td>
@@ -2801,25 +2859,26 @@ export default function App() {
               </div></td>
             </tr>)
             if (groupVideoSessions && sessionEnd) rows.push(
-              <tr className="session-summary" key={`session-summary-${video.id}`}><td colSpan="9"><span><i />Session {sessionEnd.number} total <strong>{formatTotalDuration(sessionEnd.durationSeconds)}</strong><i /></span></td></tr>
+              <tr className="session-summary" key={`session-summary-${video.id}`}><td colSpan="10"><span><i />Session {sessionEnd.number} total <strong>{formatTotalDuration(sessionEnd.durationSeconds)}</strong><i /></span></td></tr>
             )
             return rows
           })}</tbody></table>
           {!loading && videos.length === 0 && <div className="empty"><span>00:00</span><h3>No videos yet</h3><p>Videos will appear here after the phone completes its first upload.</p></div>}
           {loading && <div className="empty"><div className="spinner" /><p>Loading video library...</p></div>}
-        </div> : <div className="table-wrap"><table><thead><tr><th className="select-cell"><input type="checkbox" checked={allVisibleSelected} onChange={() => toggleAll(audio, selectedAudioIds, setSelectedAudioIds)} aria-label="Select all visible audio recordings" /></th><th>Recorded</th><th>File</th><th>Source</th><th>Duration</th><th>Size</th><th>Status</th><th>Actions</th></tr></thead>
+        </div> : <div className="table-wrap"><table><thead><tr><th className="select-cell"><input type="checkbox" checked={allVisibleSelected} onChange={() => toggleAll(audio, selectedAudioIds, setSelectedAudioIds)} aria-label="Select all visible audio recordings" /></th><th>Recorded</th><th>File</th><th>Source</th><th>Note</th><th>Duration</th><th>Size</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>{audio.flatMap((recording, index) => {
             const rows = []
             const sessionStart = audioSessions.starts.get(index)
             const sessionEnd = audioSessions.ends.get(index)
             if (groupAudioSessions && sessionStart) rows.push(
-              <tr className="session-header" key={`audio-session-header-${recording.id}`}><td colSpan="8"><div><span><SessionSelectionCheckbox items={sessionStart.recordings} selectedIds={selectedAudioIds} setSelectedIds={setSelectedAudioIds} label={`Select all recordings in session ${sessionStart.number}`} /><strong>Session {sessionStart.number}</strong><small>{sessionStart.count} {sessionStart.count === 1 ? 'recording' : 'recordings'} · {sessionStart.recordings[0]?.sourceDeviceName || 'No source'}</small></span><button type="button" onClick={() => setSelectedAudioSession(sessionStart)}><Icon name="play" />Play session</button></div></td></tr>
+              <tr className="session-header" key={`audio-session-header-${recording.id}`}><td colSpan="9"><div><span><SessionSelectionCheckbox items={sessionStart.recordings} selectedIds={selectedAudioIds} setSelectedIds={setSelectedAudioIds} label={`Select all recordings in session ${sessionStart.number}`} /><strong>Session {sessionStart.number}</strong><small>{sessionStart.count} {sessionStart.count === 1 ? 'recording' : 'recordings'} · {sessionStart.recordings[0]?.sourceDeviceName || 'No source'}</small></span><button type="button" onClick={() => setSelectedAudioSession(sessionStart)}><Icon name="play" />Play session</button></div></td></tr>
             )
             rows.push(<tr className={groupAudioSessions ? 'audio-row grouped' : 'audio-row'} key={recording.id}>
               <td className="select-cell"><input type="checkbox" checked={selectedAudioIds.has(recording.id)} onChange={() => toggleSelection(setSelectedAudioIds, recording.id)} aria-label={`Select ${recording.originalFilename || recording.filename}`} /></td>
               <td>{formatDate(recording.startTime)}</td>
               <td className="file"><span>{recording.originalFilename || recording.filename}</span><small>#{recording.id}</small></td>
               <td><SourceSelect recording={recording} devices={devices} disabled={sourceSavingIds.has(`audio:${recording.id}`)} onChange={source => updateRecordingSource('audio', recording, source)} /></td>
+              <td><button className={`note-preview ${recording.note ? 'has-note' : ''}`} onClick={() => openNoteEditor('audio', recording)} title={recording.note || 'Add note'}>{recording.note || 'Add note'}</button></td>
               <td>{formatDuration(recording.durationSeconds)}</td><td>{formatBytes(recording.fileSizeBytes)}</td>
               <td><div className="recording-status"><span className={`pill ${recording.locked ? 'locked' : ''}`}>{recording.locked ? 'Locked' : 'Unlocked'}</span>
                 {recording.transcriptStatus && recording.transcriptStatus !== 'none' && <span className={`transcript-status ${recording.transcriptStatus}`} title={recording.transcriptError || ''}>{recording.transcriptStatus === 'ready' ? 'Transcript ready' : recording.transcriptStatus === 'failed' ? 'Transcript failed' : recording.transcriptStatus === 'queued' ? 'Transcript queued' : 'Transcribing'}</span>}
@@ -2838,7 +2897,7 @@ export default function App() {
               </div></td>
             </tr>)
             if (groupAudioSessions && sessionEnd) rows.push(
-              <tr className="session-summary" key={`audio-session-summary-${recording.id}`}><td colSpan="8"><span><i />Session {sessionEnd.number} total <strong>{formatTotalDuration(sessionEnd.durationSeconds)}</strong><i /></span></td></tr>
+              <tr className="session-summary" key={`audio-session-summary-${recording.id}`}><td colSpan="9"><span><i />Session {sessionEnd.number} total <strong>{formatTotalDuration(sessionEnd.durationSeconds)}</strong><i /></span></td></tr>
             )
             return rows
           })}</tbody></table>
@@ -2889,6 +2948,7 @@ export default function App() {
       <p>{formatDate(selectedAudioSession.recordings[0].startTime)} to {formatDate(selectedAudioSession.recordings.at(-1).endTime)} | {formatTotalDuration(selectedAudioSession.durationSeconds)} including short silent intervals</p>
     </div></div>}
     {selectedTranscript && <TranscriptViewer transcript={selectedTranscript} onClose={() => setSelectedTranscript(null)} onDelete={deleteAudioTranscript} />}
+    {noteEditor && <RecordingNoteEditor key={`${noteEditor.type}:${noteEditor.ids.join(',')}`} editor={noteEditor} saving={noteSaving} onClose={() => setNoteEditor(null)} onSave={saveRecordingNote} />}
     {liveDevice && <LiveViewer device={liveDevice} onClose={options => stopLive(liveDevice.deviceId, options)} onTorch={enabled => setLiveTorch(liveDevice.deviceId, enabled)} onCamera={facing => setLiveCamera(liveDevice.deviceId, facing)} />}
     {batteryHistory && <BatteryHistoryModal state={batteryHistory} onRange={hours => loadBatteryHistory(batteryHistory.device, hours)} onClose={closeBatteryHistory} />}
   </div>

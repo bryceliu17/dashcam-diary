@@ -1,6 +1,6 @@
-# Local Dashcam
+# Dashcam Diary
 
-A self-hosted Android dashcam and audio-journal system. Phones record locally first, keep a rotating local archive, and upload completed recordings to a home server when validated Wi-Fi and the server are available.
+Dashcam Diary is a self-hosted Android dashcam and audio-journal system. Phones record locally first, keep a rotating local archive, and upload completed recordings to a home server when validated Wi-Fi and the server are available.
 
 The phone remains the source of truth until an upload succeeds. A server outage or failed upload never removes the local recording.
 

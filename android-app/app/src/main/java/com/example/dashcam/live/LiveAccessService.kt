@@ -731,7 +731,7 @@ class LiveAccessService : Service() {
 
     private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_dashcam)
-        .setContentTitle("Dashcam server connection")
+        .setContentTitle("Dashcam Diary server connection")
         .setContentText(
             when {
                 streaming -> "Live camera streaming"
@@ -765,7 +765,7 @@ class LiveAccessService : Service() {
     private fun createNotificationChannel() {
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Dashcam live access", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Dashcam Diary live access", NotificationManager.IMPORTANCE_LOW)
             )
     }
 

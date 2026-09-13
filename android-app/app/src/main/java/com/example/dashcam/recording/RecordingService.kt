@@ -318,7 +318,7 @@ class RecordingService : LifecycleService() {
 
     private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_dashcam)
-        .setContentTitle("Dashcam recording")
+        .setContentTitle("Dashcam Diary recording")
         .setContentText("Video segments: ${VideoSegmentSettings.displayLabel(this)}")
         .setOngoing(true)
         .setContentIntent(PendingIntent.getActivity(
@@ -333,7 +333,7 @@ class RecordingService : LifecycleService() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Dashcam recording", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Dashcam Diary recording", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }

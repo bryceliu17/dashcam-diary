@@ -289,7 +289,7 @@ class AudioRecordingService : Service() {
 
     private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_dashcam)
-        .setContentTitle("Dashcam audio recording")
+        .setContentTitle("Dashcam Diary audio recording")
         .setContentText(text)
         .setOngoing(true)
         .setContentIntent(
@@ -313,7 +313,7 @@ class AudioRecordingService : Service() {
 
     private fun createNotificationChannel() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Dashcam audio recording", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID, "Dashcam Diary audio recording", NotificationManager.IMPORTANCE_LOW)
         )
     }
 

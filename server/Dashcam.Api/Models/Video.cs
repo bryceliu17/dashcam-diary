@@ -13,6 +13,7 @@ public sealed class Video
     public int DurationSeconds { get; set; }
     public long FileSizeBytes { get; set; }
     public bool Locked { get; set; }
+    public string Note { get; set; } = string.Empty;
     public int PlaybackRotationDegrees { get; set; }
     public DateTime UploadedAt { get; set; }
     public DateTime CreatedAt { get; set; }

@@ -102,6 +102,7 @@ await using (var scope = app.Services.CreateAsyncScope())
     await EnsureAudioTableAsync(db);
     await EnsureDeviceStatusTableAsync(db);
     await EnsureRecordingSourceColumnsAsync(db);
+    await EnsureRecordingNotesAsync(db);
     await db.Database.ExecuteSqlRawAsync(
         "UPDATE AudioRecordings SET TranscriptStatus = 'failed', TranscriptError = 'Transcription was interrupted by a server restart.' WHERE TranscriptStatus IN ('queued', 'processing')");
     await db.Database.ExecuteSqlRawAsync(
@@ -1036,6 +1037,18 @@ app.MapPatch("/api/audio/{id:int}/source", async (
     return Results.Ok(ToAudioResponse(audio));
 });
 
+app.MapPatch("/api/audio/{id:int}/note", async (
+    int id, RecordingNoteRequest request, DashcamDbContext db, CancellationToken token) =>
+{
+    if (!TryNormalizeNote(request.Note, out var note))
+        return Results.BadRequest(new { error = "note must be 4,000 characters or fewer." });
+    var audio = await db.AudioRecordings.SingleOrDefaultAsync(x => x.Id == id, token);
+    if (audio is null) return Results.NotFound();
+    audio.Note = note;
+    await db.SaveChangesAsync(token);
+    return Results.Ok(ToAudioResponse(audio));
+});
+
 app.MapPatch("/api/audio/bulk/lock", async (
     BulkLockRequest request, DashcamDbContext db, CancellationToken token) =>
 {
@@ -1050,6 +1063,20 @@ app.MapPatch("/api/audio/bulk/lock", async (
         items = recordings.Select(ToAudioResponse).ToList(),
         notFoundIds = ids.Where(id => !foundIds.Contains(id)).ToList()
     });
+});
+
+app.MapPatch("/api/audio/bulk/note", async (
+    BulkRecordingNoteRequest request, DashcamDbContext db, CancellationToken token) =>
+{
+    var ids = NormalizeBulkIds(request.Ids);
+    if (ids is null) return Results.BadRequest(new { error = "ids must contain between 1 and 200 positive IDs." });
+    if (!TryNormalizeNote(request.Note, out var note))
+        return Results.BadRequest(new { error = "note must be 4,000 characters or fewer." });
+    var recordings = await db.AudioRecordings.Where(x => ids.Contains(x.Id)).ToListAsync(token);
+    foreach (var recording in recordings) recording.Note = note;
+    await db.SaveChangesAsync(token);
+    var foundIds = recordings.Select(x => x.Id).ToHashSet();
+    return Results.Ok(new { items = recordings.Select(ToAudioResponse).ToList(), notFoundIds = ids.Where(id => !foundIds.Contains(id)).ToList() });
 });
 
 app.MapDelete("/api/audio/bulk", async (
@@ -1516,6 +1543,18 @@ app.MapPatch("/api/videos/{id:int}/source", async (
     return Results.Ok(ToResponse(video));
 });
 
+app.MapPatch("/api/videos/{id:int}/note", async (
+    int id, RecordingNoteRequest request, DashcamDbContext db, CancellationToken token) =>
+{
+    if (!TryNormalizeNote(request.Note, out var note))
+        return Results.BadRequest(new { error = "note must be 4,000 characters or fewer." });
+    var video = await db.Videos.SingleOrDefaultAsync(x => x.Id == id, token);
+    if (video is null) return Results.NotFound();
+    video.Note = note;
+    await db.SaveChangesAsync(token);
+    return Results.Ok(ToResponse(video));
+});
+
 app.MapPatch("/api/videos/bulk/lock", async (
     BulkLockRequest request, DashcamDbContext db, CancellationToken token) =>
 {
@@ -1530,6 +1569,20 @@ app.MapPatch("/api/videos/bulk/lock", async (
         items = videos.Select(ToResponse).ToList(),
         notFoundIds = ids.Where(id => !foundIds.Contains(id)).ToList()
     });
+});
+
+app.MapPatch("/api/videos/bulk/note", async (
+    BulkRecordingNoteRequest request, DashcamDbContext db, CancellationToken token) =>
+{
+    var ids = NormalizeBulkIds(request.Ids);
+    if (ids is null) return Results.BadRequest(new { error = "ids must contain between 1 and 200 positive IDs." });
+    if (!TryNormalizeNote(request.Note, out var note))
+        return Results.BadRequest(new { error = "note must be 4,000 characters or fewer." });
+    var videos = await db.Videos.Where(x => ids.Contains(x.Id)).ToListAsync(token);
+    foreach (var video in videos) video.Note = note;
+    await db.SaveChangesAsync(token);
+    var foundIds = videos.Select(x => x.Id).ToHashSet();
+    return Results.Ok(new { items = videos.Select(ToResponse).ToList(), notFoundIds = ids.Where(id => !foundIds.Contains(id)).ToList() });
 });
 
 app.MapPatch("/api/videos/bulk/rotation", async (
@@ -2394,6 +2447,7 @@ static async Task EnsureAudioTableAsync(DashcamDbContext db)
             DurationSeconds INTEGER NOT NULL,
             FileSizeBytes INTEGER NOT NULL,
             Locked INTEGER NOT NULL,
+            Note TEXT NOT NULL DEFAULT '',
             UploadedAt TEXT NOT NULL,
             CreatedAt TEXT NOT NULL
         )
@@ -2494,6 +2548,12 @@ static async Task EnsureRecordingSourceColumnsAsync(DashcamDbContext db)
             WHERE SourceDeviceId IS NULL AND SourceDeviceName IS NULL
             """);
     }
+}
+
+static async Task EnsureRecordingNotesAsync(DashcamDbContext db)
+{
+    await EnsureColumnAsync(db, "Videos", "Note", "TEXT NOT NULL DEFAULT ''");
+    await EnsureColumnAsync(db, "AudioRecordings", "Note", "TEXT NOT NULL DEFAULT ''");
 }
 
 static async Task<bool> EnsureColumnAsync(DashcamDbContext db, string table, string column, string definition)
@@ -2765,6 +2825,7 @@ static object ToResponse(Video video) => new
     video.DurationSeconds,
     video.FileSizeBytes,
     video.Locked,
+    video.Note,
     video.PlaybackRotationDegrees,
     UploadedAt = AsUtc(video.UploadedAt),
     streamUrl = $"/api/videos/{video.Id}/stream"
@@ -2782,6 +2843,7 @@ static object ToAudioResponse(AudioRecording audio) => new
     audio.DurationSeconds,
     audio.FileSizeBytes,
     audio.Locked,
+    audio.Note,
     transcriptStatus = audio.TranscriptStatus,
     transcriptLanguage = audio.TranscriptLanguage,
     transcriptLanguageProbability = audio.TranscriptLanguageProbability,
@@ -3019,6 +3081,12 @@ static string? CleanNullableText(string? value, int maxLength)
     return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength];
 }
 
+static bool TryNormalizeNote(string? value, out string note)
+{
+    note = value?.Trim() ?? string.Empty;
+    return note.Length <= 4000;
+}
+
 static string? NormalizeIpAddress(string? value)
 {
     if (!System.Net.IPAddress.TryParse(value?.Trim(), out var address)) return null;
@@ -3043,6 +3111,8 @@ static List<int>? NormalizeBulkIds(IEnumerable<int>? requestedIds)
 public sealed record LockRequest(bool Locked);
 public sealed record BulkIdsRequest(int[] Ids);
 public sealed record BulkLockRequest(int[] Ids, bool Locked);
+public sealed record RecordingNoteRequest(string? Note);
+public sealed record BulkRecordingNoteRequest(int[] Ids, string? Note);
 public sealed record BulkRotationRequest(int[] Ids, int PlaybackRotationDegrees);
 public sealed record RotationRequest(int PlaybackRotationDegrees);
 public sealed record RecordingSourceRequest(string? SourceDeviceId, string? SourceDeviceName);

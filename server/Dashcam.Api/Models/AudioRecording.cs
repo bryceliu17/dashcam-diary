@@ -13,6 +13,7 @@ public sealed class AudioRecording
     public int DurationSeconds { get; set; }
     public long FileSizeBytes { get; set; }
     public bool Locked { get; set; }
+    public string Note { get; set; } = string.Empty;
     public string TranscriptStatus { get; set; } = "none";
     public string TranscriptText { get; set; } = string.Empty;
     public string TranscriptLanguage { get; set; } = string.Empty;

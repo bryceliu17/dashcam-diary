@@ -246,7 +246,7 @@ class MainActivity : ComponentActivity() {
             } else if (PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this) &&
                 !isVolumeKeyAccessibilityEnabled()
             ) {
-                toast("Enable Dashcam Volume Up Double-Press in Accessibility settings")
+                toast("Enable Dashcam Diary Volume Up Double-Press in Accessibility settings")
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         } else {
@@ -447,10 +447,10 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.rgb(244, 244, 240))
         }
         root.addView(TextView(this).apply {
-            text = "LOCAL DASHCAM"; textSize = 11f; letterSpacing = .18f; setTextColor(Color.rgb(77, 124, 15))
+            text = "DASHCAM DIARY"; textSize = 11f; letterSpacing = .18f; setTextColor(Color.rgb(77, 124, 15))
         })
         root.addView(TextView(this).apply {
-            text = "Dashcam"; textSize = 30f; setTextColor(Color.rgb(17, 24, 39)); setPadding(0, dp(3), 0, dp(18))
+            text = "Dashcam Diary"; textSize = 30f; setTextColor(Color.rgb(17, 24, 39)); setPadding(0, dp(3), 0, dp(18))
         })
 
         recordingStatus = statusRow("Recording")
@@ -560,7 +560,7 @@ class MainActivity : ComponentActivity() {
         settingsContainer.addView(serverUrlRow, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) })
 
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        previewRecordButton = actionButton(if (recording != null || continueRecording) "Stop Dashcam" else "Start Dashcam") {
+        previewRecordButton = actionButton(if (recording != null || continueRecording) "Stop Dashcam Diary" else "Start Dashcam Diary") {
             if (recording != null || continueRecording) {
                 stopDashcam("Stopped by user")
             } else if (!backgroundRecordingActive) {
@@ -1622,7 +1622,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (recording != null || continueRecording) {
-            toast("Stop dashcam recording first")
+            toast("Stop Dashcam Diary recording first")
             return
         }
         pendingBackgroundStart = true
@@ -1642,7 +1642,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (recording != null || continueRecording) {
-            toast("Stop dashcam recording first")
+            toast("Stop Dashcam Diary recording first")
             return
         }
         PowerRecordingSettings.setPowerAutoStartSuppressed(this, false)
@@ -1779,7 +1779,7 @@ class MainActivity : ComponentActivity() {
         if ((mode == RecordingMode.VolumeVideoDoublePress || mode == RecordingMode.VolumeAudioDoublePress) &&
             !isVolumeKeyAccessibilityEnabled()
         ) {
-            toast("Enable Dashcam Volume Up Double-Press in Accessibility settings")
+            toast("Enable Dashcam Diary Volume Up Double-Press in Accessibility settings")
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         } else {
             toast("Recording mode: ${mode.label}")
@@ -2725,7 +2725,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (::previewRecordButton.isInitialized) {
-            previewRecordButton.text = if (active) "Stop Dashcam" else "Start Dashcam"
+            previewRecordButton.text = if (active) "Stop Dashcam Diary" else "Start Dashcam Diary"
             previewRecordButton.isEnabled = !liveStreaming && (
                 active ||
                     (!backgroundRecordingActive &&
