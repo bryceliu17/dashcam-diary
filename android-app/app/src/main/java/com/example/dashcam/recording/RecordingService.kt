@@ -139,7 +139,7 @@ class RecordingService : LifecycleService() {
                 updateSegmentDuration(event)
                 if (startAlertPending) {
                     startAlertPending = false
-                    RecordingStartAlert.show(this)
+                    RecordingStartAlert.show(this, RecordingStartAlertType.Video)
                 }
                 broadcastState(true, "Recording segment started")
                 scheduleSegmentRotation()

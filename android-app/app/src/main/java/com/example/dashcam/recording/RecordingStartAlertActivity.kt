@@ -27,6 +27,11 @@ enum class RecordingStartAlertMode(
     SoundAndScreen("Sound + screen", true, true)
 }
 
+enum class RecordingStartAlertType(val title: String) {
+    Video("VIDEO RECORDING STARTED"),
+    Audio("AUDIO RECORDING STARTED")
+}
+
 object RecordingStartAlertSettings {
     private const val PREFS = "dashcam_settings"
     private const val KEY_MODE = "recording_start_alert_mode"
@@ -57,12 +62,13 @@ object RecordingStartAlertSettings {
 object RecordingStartAlert {
     private val handler = Handler(Looper.getMainLooper())
 
-    fun show(context: Context) {
+    fun show(context: Context, type: RecordingStartAlertType) {
         val mode = RecordingStartAlertSettings.mode(context)
         if (mode.playsSound) playTone()
         if (mode.showsScreen) {
             context.applicationContext.startActivity(
                 Intent(context.applicationContext, RecordingStartAlertActivity::class.java).apply {
+                    putExtra(RecordingStartAlertActivity.EXTRA_RECORDING_TYPE, type.name)
                     addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK or
                             Intent.FLAG_ACTIVITY_NO_HISTORY or
@@ -105,6 +111,9 @@ class RecordingStartAlertActivity : Activity() {
     }
 
     private fun buildContent() = LinearLayout(this).apply {
+        val alertType = intent.getStringExtra(EXTRA_RECORDING_TYPE)
+            ?.let { saved -> RecordingStartAlertType.entries.firstOrNull { it.name == saved } }
+            ?: RecordingStartAlertType.Video
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
         setPadding(dp(24), dp(24), dp(24), dp(24))
@@ -117,14 +126,14 @@ class RecordingStartAlertActivity : Activity() {
             setTextColor(Color.rgb(239, 68, 68))
         })
         addView(TextView(this@RecordingStartAlertActivity).apply {
-            text = "开始录制"
+            text = alertType.title
             textSize = 38f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
         })
         addView(TextView(this@RecordingStartAlertActivity).apply {
-            text = "RECORDING STARTED"
+            text = "DASHCAM DIARY"
             textSize = 15f
             gravity = Gravity.CENTER
             setPadding(0, dp(10), 0, 0)
@@ -160,6 +169,7 @@ class RecordingStartAlertActivity : Activity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 
     companion object {
+        const val EXTRA_RECORDING_TYPE = "recording_start_alert_type"
         private const val DISPLAY_DURATION_MS = 3_000L
     }
 }

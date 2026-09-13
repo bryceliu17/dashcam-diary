@@ -281,7 +281,7 @@ class BackgroundRecordingService : Service() {
         RemoteRecordingControl.recorderStarted = true
         if (!startAlertPending) return
         startAlertPending = false
-        mainHandler.post { RecordingStartAlert.show(this@BackgroundRecordingService) }
+        mainHandler.post { RecordingStartAlert.show(this@BackgroundRecordingService, RecordingStartAlertType.Video) }
     }
 
     private fun createRecorder(file: File): MediaRecorder {

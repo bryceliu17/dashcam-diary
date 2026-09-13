@@ -78,6 +78,7 @@ import com.example.dashcam.recording.RecordingService
 import com.example.dashcam.recording.RecordingStartAlert
 import com.example.dashcam.recording.RecordingStartAlertMode
 import com.example.dashcam.recording.RecordingStartAlertSettings
+import com.example.dashcam.recording.RecordingStartAlertType
 import com.example.dashcam.recording.StoragePolicy
 import com.example.dashcam.recording.StorageLimitSettings
 import com.example.dashcam.recording.VideoSegmentSettings
@@ -2413,7 +2414,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (foregroundStartAlertPending) {
                         foregroundStartAlertPending = false
-                        RecordingStartAlert.show(this)
+                        RecordingStartAlert.show(this, RecordingStartAlertType.Video)
                     }
                     renderRecording(true)
                     toast("Recording segment started")
