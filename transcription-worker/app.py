@@ -1,7 +1,9 @@
 import os
 import subprocess
 import threading
+import time
 import warnings
+import gc
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,10 @@ DIARIZATION_MODEL = os.environ.get(
 )
 DIARIZATION_DEVICE = os.environ.get("PYANNOTE_DEVICE", MODEL_DEVICE)
 HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "").strip()
+try:
+    MODEL_IDLE_UNLOAD_SECONDS = max(0, int(os.environ.get("MODEL_IDLE_UNLOAD_SECONDS", "600")))
+except ValueError:
+    MODEL_IDLE_UNLOAD_SECONDS = 600
 
 app = FastAPI(title="Dashcam audio transcription worker")
 model = None
@@ -27,6 +33,49 @@ diarization_pipeline = None
 model_lock = threading.Lock()
 diarization_model_lock = threading.Lock()
 transcription_lock = threading.Lock()
+model_idle_timer = None
+model_last_used_at = None
+
+
+def release_idle_models() -> None:
+    """Unload idle GPU models without racing an active transcription."""
+    global model, diarization_pipeline, model_idle_timer, model_last_used_at
+    with transcription_lock:
+        if model_last_used_at is None or MODEL_IDLE_UNLOAD_SECONDS <= 0:
+            return
+        remaining = MODEL_IDLE_UNLOAD_SECONDS - (time.monotonic() - model_last_used_at)
+        if remaining > 0:
+            model_idle_timer = threading.Timer(remaining, release_idle_models)
+            model_idle_timer.daemon = True
+            model_idle_timer.start()
+            return
+
+        with model_lock:
+            model = None
+        with diarization_model_lock:
+            diarization_pipeline = None
+        model_last_used_at = None
+        model_idle_timer = None
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def schedule_idle_model_release() -> None:
+    global model_idle_timer, model_last_used_at
+    if MODEL_IDLE_UNLOAD_SECONDS <= 0:
+        return
+    model_last_used_at = time.monotonic()
+    if model_idle_timer is not None:
+        model_idle_timer.cancel()
+    model_idle_timer = threading.Timer(MODEL_IDLE_UNLOAD_SECONDS, release_idle_models)
+    model_idle_timer.daemon = True
+    model_idle_timer.start()
 
 
 class TranscriptionRequest(BaseModel):
@@ -210,6 +259,7 @@ def health():
         "model": MODEL_NAME,
         "device": MODEL_DEVICE,
         "computeType": COMPUTE_TYPE,
+        "idleUnloadSeconds": MODEL_IDLE_UNLOAD_SECONDS,
         "modelLoaded": model is not None,
         "diarizationModel": DIARIZATION_MODEL,
         "diarizationConfigured": bool(HUGGINGFACE_TOKEN),
@@ -221,50 +271,53 @@ def health():
 def transcribe(request: TranscriptionRequest):
     audio_path = validate_audio_path(request.path)
     with transcription_lock:
-        segments_iterator, info = get_model().transcribe(
-            str(audio_path),
-            task="transcribe",
-            language=None,
-            multilingual=True,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            condition_on_previous_text=True,
-            word_timestamps=True,
-        )
-        segments = []
-        words = []
-        for segment in segments_iterator:
-            text = segment.text.strip()
-            if text:
-                segments.append({
-                    "start": round(float(segment.start), 3),
-                    "end": round(float(segment.end), 3),
-                    "text": text,
-                })
-            for word in segment.words or []:
-                if word.start is None or word.end is None or not word.word.strip():
-                    continue
-                words.append({
-                    "start": float(word.start),
-                    "end": float(word.end),
-                    "text": word.word,
-                })
+        try:
+            segments_iterator, info = get_model().transcribe(
+                str(audio_path),
+                task="transcribe",
+                language=None,
+                multilingual=True,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                condition_on_previous_text=True,
+                word_timestamps=True,
+            )
+            segments = []
+            words = []
+            for segment in segments_iterator:
+                text = segment.text.strip()
+                if text:
+                    segments.append({
+                        "start": round(float(segment.start), 3),
+                        "end": round(float(segment.end), 3),
+                        "text": text,
+                    })
+                for word in segment.words or []:
+                    if word.start is None or word.end is None or not word.word.strip():
+                        continue
+                    words.append({
+                        "start": float(word.start),
+                        "end": float(word.end),
+                        "text": word.word,
+                    })
 
-        diarization_status = "not_configured"
-        diarization_error = ""
-        speaker_count = 0
-        if HUGGINGFACE_TOKEN:
-            try:
-                waveform = load_audio_waveform(audio_path)
-                turns = diarization_turns(get_diarization_pipeline()(waveform))
-                speaker_segments, speaker_count = merge_words_by_speaker(words, turns)
-                if speaker_segments:
-                    segments = speaker_segments
-                diarization_status = "ready"
-            except Exception as error:
-                diarization_status = "failed"
-                diarization_error = str(error)[:1000]
+            diarization_status = "not_configured"
+            diarization_error = ""
+            speaker_count = 0
+            if HUGGINGFACE_TOKEN:
+                try:
+                    waveform = load_audio_waveform(audio_path)
+                    turns = diarization_turns(get_diarization_pipeline()(waveform))
+                    speaker_segments, speaker_count = merge_words_by_speaker(words, turns)
+                    if speaker_segments:
+                        segments = speaker_segments
+                    diarization_status = "ready"
+                except Exception as error:
+                    diarization_status = "failed"
+                    diarization_error = str(error)[:1000]
+        finally:
+            schedule_idle_model_release()
 
     return {
         "text": " ".join(segment["text"] for segment in segments).strip(),
