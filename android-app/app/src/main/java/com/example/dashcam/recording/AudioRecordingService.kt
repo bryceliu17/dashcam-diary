@@ -153,7 +153,7 @@ class AudioRecordingService : Service() {
             RemoteRecordingControl.audioRecorderStarted = true
             if (startAlertPending) {
                 startAlertPending = false
-                RecordingStartAlert.show(this)
+                RecordingStartAlert.show(this, RecordingStartAlertType.Audio)
             }
             updateNotification("Recording ${destination.name}")
             broadcastState(true, 0, destination.name)
