@@ -519,7 +519,7 @@ class BackgroundRecordingService : Service() {
 
     private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_dashcam)
-        .setContentTitle("Dashcam background recording")
+        .setContentTitle("Dashcam Diary background recording")
         .setContentText(text)
         .setOngoing(true)
         .setContentIntent(PendingIntent.getActivity(
@@ -540,7 +540,7 @@ class BackgroundRecordingService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Dashcam background recording", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Dashcam Diary background recording", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }

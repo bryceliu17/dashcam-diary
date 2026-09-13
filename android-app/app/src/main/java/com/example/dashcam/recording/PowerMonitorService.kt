@@ -140,7 +140,7 @@ class PowerMonitorService : Service() {
 
     private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_dashcam)
-        .setContentTitle("Dashcam power monitor")
+        .setContentTitle("Dashcam Diary power monitor")
         .setContentText("Waiting for power connection")
         .setOngoing(true)
         .setContentIntent(PendingIntent.getActivity(
@@ -152,7 +152,7 @@ class PowerMonitorService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Dashcam power monitor", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Dashcam Diary power monitor", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }
