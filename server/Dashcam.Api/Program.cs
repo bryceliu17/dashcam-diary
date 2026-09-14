@@ -960,6 +960,54 @@ app.MapGet("/api/audio/{id:int}/transcription", async (
         : Results.Ok(ToTranscriptResponse(audio, includeText: true));
 });
 
+app.MapPatch("/api/audio/{id:int}/transcription/speakers", async (
+    int id, TranscriptSpeakerNamesRequest request, DashcamDbContext db, CancellationToken token) =>
+{
+    var audio = await db.AudioRecordings.SingleOrDefaultAsync(x => x.Id == id, token);
+    if (audio is null) return Results.NotFound();
+    if (audio.TranscriptStatus != "ready")
+        return Results.Conflict(new { error = "The transcript is not ready." });
+    if (request.Names is null || request.Names.Count is < 1 or > 50)
+        return Results.BadRequest(new { error = "Provide between 1 and 50 speaker names." });
+
+    List<AudioTranscriptSegment> segments;
+    try
+    {
+        segments = JsonSerializer.Deserialize<List<AudioTranscriptSegment>>(
+            audio.TranscriptSegmentsJson,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+    }
+    catch (JsonException)
+    {
+        return Results.Conflict(new { error = "This transcript has no editable speaker labels." });
+    }
+
+    var existingSpeakers = segments
+        .Select(segment => segment.Speaker?.Trim())
+        .Where(speaker => !string.IsNullOrWhiteSpace(speaker))
+        .Cast<string>()
+        .ToHashSet(StringComparer.Ordinal);
+    if (existingSpeakers.Count == 0)
+        return Results.Conflict(new { error = "Speaker separation was not available for this transcript." });
+
+    var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var pair in request.Names)
+    {
+        var source = CleanRequiredText(pair.Key, 120);
+        var name = CleanRequiredText(pair.Value, 120);
+        if (source is null || name is null || !existingSpeakers.Contains(source))
+            return Results.BadRequest(new { error = "Each speaker name must be non-empty, under 120 characters, and match this transcript." });
+        replacements[source] = name;
+    }
+
+    audio.TranscriptSegmentsJson = JsonSerializer.Serialize(segments.Select(segment =>
+        segment.Speaker is not null && replacements.TryGetValue(segment.Speaker.Trim(), out var name)
+            ? segment with { Speaker = name }
+            : segment));
+    await db.SaveChangesAsync(token);
+    return Results.Ok(ToTranscriptResponse(audio, includeText: true));
+});
+
 app.MapGet("/api/audio/{id:int}/transcription/download", async (
     int id, DashcamDbContext db, CancellationToken token) =>
 {
@@ -3138,6 +3186,7 @@ public sealed record AudioExportJob(
     DateTime? CompletedAtUtc);
 public sealed record VideoProbeInfo(double DurationSeconds, bool HasAudio);
 public sealed record AudioTranscriptSegment(double Start, double End, string Text, string? Speaker = null);
+public sealed record TranscriptSpeakerNamesRequest(Dictionary<string, string>? Names);
 public sealed record AudioTranscriptionWorkerResponse(
     string? Text,
     string? Language,

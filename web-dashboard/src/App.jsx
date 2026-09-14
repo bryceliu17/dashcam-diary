@@ -918,20 +918,30 @@ function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlay
   </div>
 }
 
-function TranscriptViewer({ transcript, onClose, onDelete }) {
+function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState(null)
   const [waveformExpanded, setWaveformExpanded] = useState(false)
-  const segments = Array.isArray(transcript.segments)
-    ? transcript.segments.filter(segment => segment?.text)
-    : []
+  const [editingSpeakers, setEditingSpeakers] = useState(false)
+  const [speakerNames, setSpeakerNames] = useState({})
+  const [speakerSaving, setSpeakerSaving] = useState(false)
+  const segments = Array.isArray(transcript.segments) ? transcript.segments.filter(segment => segment?.text) : []
   const hasSpeakerLabels = segments.some(segment => segment.speaker)
+  const speakers = [...new Set(segments.map(segment => segment.speaker).filter(Boolean))]
+  const speakerKey = speakers.join('\u0000')
 
-  const seekToSegment = segment => {
-    setSeekRequest(current => ({
-      id: (current?.id || 0) + 1,
-      time: Number(segment.start) || 0,
-    }))
+  useEffect(() => {
+    setSpeakerNames(Object.fromEntries(speakers.map(speaker => [speaker, speaker])))
+    setEditingSpeakers(false)
+  }, [transcript.recording.id, speakerKey])
+
+  const seekToSegment = segment => setSeekRequest(current => ({ id: (current?.id || 0) + 1, time: Number(segment.start) || 0 }))
+  const saveSpeakerNames = async () => {
+    setSpeakerSaving(true)
+    try {
+      await onRenameSpeakers(transcript.recording, speakerNames)
+      setEditingSpeakers(false)
+    } finally { setSpeakerSaving(false) }
   }
 
   return <div className="modal" onMouseDown={() => !transcript.deleting && onClose()}><div className="player transcript-modal" onMouseDown={event => event.stopPropagation()}>
@@ -940,13 +950,10 @@ function TranscriptViewer({ transcript, onClose, onDelete }) {
       <div className="transcript-meta"><span>Language <strong>{transcript.language || 'Unknown'}{transcript.languageProbability ? ` · ${Math.round(transcript.languageProbability * 100)}%` : ''}</strong></span><span>Model <strong>{transcript.model || '—'}</strong></span><span>Speakers <strong>{transcript.diarizationStatus === 'ready' ? (transcript.speakerCount || 'No speech') : transcript.diarizationStatus === 'failed' ? 'Unavailable' : 'Not configured'}</strong></span></div>
       {transcript.diarizationStatus !== 'ready' && <p className="transcript-diarization-note">{transcript.diarizationStatus === 'failed' ? `Speaker separation failed${transcript.diarizationError ? `: ${transcript.diarizationError}` : '.'}` : 'Speaker separation was not configured when this transcript was generated.'}</p>}
       <div className={`transcript-player ${waveformExpanded ? '' : 'collapsed'}`}><div className="transcript-player-toolbar"><strong>Audio playback</strong><button type="button" onClick={() => setWaveformExpanded(current => !current)}>{waveformExpanded ? 'Hide waveform' : 'Show waveform'}</button></div><WaveformAudio recording={transcript.recording} autoPlay={false} showWaveform={waveformExpanded} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} /></div>
+      {hasSpeakerLabels && <section className="transcript-speaker-editor"><div><strong>Speaker names</strong><small>Applies to every matching line and TXT download.</small></div>{editingSpeakers ? <><div className="transcript-speaker-fields">{speakers.map(speaker => <label key={speaker}><span>{speaker}</span><input value={speakerNames[speaker] ?? speaker} maxLength="120" onChange={event => setSpeakerNames(current => ({ ...current, [speaker]: event.target.value }))} aria-label={`Name for ${speaker}`} /></label>)}</div><div className="transcript-speaker-actions"><button type="button" disabled={speakerSaving} onClick={() => { setEditingSpeakers(false); setSpeakerNames(Object.fromEntries(speakers.map(speaker => [speaker, speaker]))) }}>Cancel</button><button type="button" className="primary" disabled={speakerSaving || speakers.some(speaker => !(speakerNames[speaker] || '').trim())} onClick={saveSpeakerNames}>{speakerSaving ? 'Saving…' : 'Save names'}</button></div></> : <button type="button" onClick={() => setEditingSpeakers(true)}>Edit speaker names</button>}</section>}
       {segments.length ? <div className="transcript-segments">{segments.map((segment, index) => {
         const active = playbackTime >= Number(segment.start) && playbackTime < Number(segment.end)
-        return <button type="button" className={`${segment.speaker ? 'has-speaker ' : ''}${active ? 'active' : ''}`} key={`${segment.start}-${index}`} onClick={() => seekToSegment(segment)} aria-label={`Play transcript from ${formatTranscriptTimestamp(segment.start)}`}>
-          <time>{formatTranscriptTimestamp(segment.start)} – {formatTranscriptTimestamp(segment.end)}</time>
-          {segment.speaker && <strong>{segment.speaker}</strong>}
-          <p>{segment.text}</p>
-        </button>
+        return <button type="button" className={`${segment.speaker ? 'has-speaker ' : ''}${active ? 'active' : ''}`} key={`${segment.start}-${index}`} onClick={() => seekToSegment(segment)} aria-label={`Play transcript from ${formatTranscriptTimestamp(segment.start)}`}><time>{formatTranscriptTimestamp(segment.start)} – {formatTranscriptTimestamp(segment.end)}</time>{segment.speaker && <strong>{segment.speaker}</strong>}<p>{segment.text}</p></button>
       })}</div> : <pre>{transcript.text || 'No speech was detected in this recording.'}</pre>}
       {hasSpeakerLabels && <p className="transcript-click-hint">Click a line to play from that point. The active line follows playback.</p>}
     </div>}
@@ -2406,6 +2413,22 @@ export default function App() {
     }
   }
 
+  const renameTranscriptSpeakers = async (recording, names) => {
+    setError('')
+    try {
+      const result = await api(`/api/audio/${recording.id}/transcription/speakers`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names }),
+      })
+      setSelectedTranscript(current => current && current.recording.id === recording.id
+        ? { ...current, ...result, error: '' }
+        : current)
+    } catch (err) {
+      setError(err.message)
+      throw err
+    }
+  }
+
   const toggleSelection = (setIds, id) => setIds(current => {
     const next = new Set(current)
     if (next.has(id)) next.delete(id)
@@ -2947,7 +2970,7 @@ export default function App() {
       <AudioSessionPlayback key={selectedAudioSession.number} session={selectedAudioSession} />
       <p>{formatDate(selectedAudioSession.recordings[0].startTime)} to {formatDate(selectedAudioSession.recordings.at(-1).endTime)} | {formatTotalDuration(selectedAudioSession.durationSeconds)} including short silent intervals</p>
     </div></div>}
-    {selectedTranscript && <TranscriptViewer transcript={selectedTranscript} onClose={() => setSelectedTranscript(null)} onDelete={deleteAudioTranscript} />}
+    {selectedTranscript && <TranscriptViewer transcript={selectedTranscript} onClose={() => setSelectedTranscript(null)} onDelete={deleteAudioTranscript} onRenameSpeakers={renameTranscriptSpeakers} />}
     {noteEditor && <RecordingNoteEditor key={`${noteEditor.type}:${noteEditor.ids.join(',')}`} editor={noteEditor} saving={noteSaving} onClose={() => setNoteEditor(null)} onSave={saveRecordingNote} />}
     {liveDevice && <LiveViewer device={liveDevice} onClose={options => stopLive(liveDevice.deviceId, options)} onTorch={enabled => setLiveTorch(liveDevice.deviceId, enabled)} onCamera={facing => setLiveCamera(liveDevice.deviceId, facing)} />}
     {batteryHistory && <BatteryHistoryModal state={batteryHistory} onRange={hours => loadBatteryHistory(batteryHistory.device, hours)} onClose={closeBatteryHistory} />}
