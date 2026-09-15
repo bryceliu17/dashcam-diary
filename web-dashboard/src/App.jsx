@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DayPicker } from '@daypicker/react'
+import L from 'leaflet'
 
 const API = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -152,21 +153,59 @@ const gpsDistanceMeters = (first, second) => {
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
+function GpsTrackMap({ items }) {
+  const containerRef = useRef(null)
+
+  useEffect(() => {
+    if (!containerRef.current || items.length === 0) return undefined
+
+    const coordinates = items.map(point => [point.latitude, point.longitude])
+    const map = L.map(containerRef.current, {
+      zoomControl: true,
+      attributionControl: true,
+    })
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+    }).addTo(map)
+    L.polyline(coordinates, {
+      color: '#8eea55',
+      weight: 5,
+      opacity: 0.95,
+      lineCap: 'round',
+      lineJoin: 'round',
+    }).addTo(map)
+    L.circleMarker(coordinates[0], {
+      radius: 7,
+      color: '#071018',
+      weight: 3,
+      fillColor: '#66b7ff',
+      fillOpacity: 1,
+    }).addTo(map).bindTooltip('Start')
+    L.circleMarker(coordinates.at(-1), {
+      radius: 7,
+      color: '#160707',
+      weight: 3,
+      fillColor: '#ff786f',
+      fillOpacity: 1,
+    }).addTo(map).bindTooltip('End')
+
+    const bounds = L.latLngBounds(coordinates)
+    if (coordinates.length === 1 || bounds.getNorthEast().equals(bounds.getSouthWest())) {
+      map.setView(coordinates[0], 17)
+    } else {
+      map.fitBounds(bounds, { padding: [28, 28], maxZoom: 17 })
+    }
+    window.setTimeout(() => map.invalidateSize(), 0)
+
+    return () => map.remove()
+  }, [items])
+
+  return <div ref={containerRef} className="gps-track-map" aria-label="Recorded GPS route on OpenStreetMap" />
+}
+
 function GpsTrackViewer({ track, onClose }) {
   const items = track.items || []
-  const latitudes = items.map(point => point.latitude)
-  const longitudes = items.map(point => point.longitude)
-  const minLatitude = Math.min(...latitudes)
-  const maxLatitude = Math.max(...latitudes)
-  const minLongitude = Math.min(...longitudes)
-  const maxLongitude = Math.max(...longitudes)
-  const latitudeSpan = Math.max(maxLatitude - minLatitude, 0.00001)
-  const longitudeSpan = Math.max(maxLongitude - minLongitude, 0.00001)
-  const route = items.map(point => {
-    const x = 20 + (point.longitude - minLongitude) / longitudeSpan * 560
-    const y = 280 - (point.latitude - minLatitude) / latitudeSpan * 260
-    return `${x.toFixed(1)},${y.toFixed(1)}`
-  }).join(' ')
   const distance = items.slice(1).reduce((total, point, index) => total + gpsDistanceMeters(items[index], point), 0)
   const maxSpeed = Math.max(0, ...items.map(point => Number(point.speedMetersPerSecond) || 0)) * 3.6
   const first = items[0]
@@ -177,7 +216,7 @@ function GpsTrackViewer({ track, onClose }) {
     <div><strong>GPS track · {filename}</strong><span className="player-actions">{items.length > 0 && <a className="transcript-download" href={`${API}/api/${track.type}/${track.recording.id}/locations/download`}><Icon name="download" />Download GPX</a>}<button className="close-player" aria-label="Close GPS track" onClick={onClose}>X</button></span></div>
     {track.loading ? <div className="transcript-loading"><div className="spinner" /><span>Loading GPS track…</span></div> : track.error ? <div className="transcript-error">{track.error}</div> : items.length === 0 ? <div className="gps-track-empty">No GPS points were recorded for this file.</div> : <>
       <div className="gps-track-summary"><span>Points<strong>{items.length}</strong></span><span>Distance<strong>{distance >= 1000 ? `${(distance / 1000).toFixed(2)} km` : `${Math.round(distance)} m`}</strong></span><span>Max speed<strong>{maxSpeed.toFixed(1)} km/h</strong></span><span>Accuracy<strong>{Math.round(items.at(-1).accuracyMeters)} m</strong></span></div>
-      <svg className="gps-track-chart" viewBox="0 0 600 300" role="img" aria-label="Recorded GPS route"><polyline points={route} /><circle className="start" cx={route.split(' ')[0]?.split(',')[0]} cy={route.split(' ')[0]?.split(',')[1]} r="6"/><circle className="end" cx={route.split(' ').at(-1)?.split(',')[0]} cy={route.split(' ').at(-1)?.split(',')[1]} r="6"/></svg>
+      <GpsTrackMap items={items} />
       <div className="gps-track-endpoints"><span>Start<strong>{first.latitude.toFixed(6)}, {first.longitude.toFixed(6)}</strong><small>{formatDate(first.recordedAt)}</small></span><span>End<strong>{last.latitude.toFixed(6)}, {last.longitude.toFixed(6)}</strong><small>{formatDate(last.recordedAt)}</small></span></div>
       <a className="gps-open-map" target="_blank" rel="noreferrer" href={`https://www.openstreetmap.org/?mlat=${first.latitude}&mlon=${first.longitude}#map=17/${first.latitude}/${first.longitude}`}>Open starting point in OpenStreetMap</a>
     </>}
