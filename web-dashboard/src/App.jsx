@@ -153,13 +153,51 @@ const gpsDistanceMeters = (first, second) => {
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-function GpsTrackMap({ items }) {
+const gpsTimeline = (items, startTime) => {
+  const startedAt = new Date(startTime).getTime()
+  return items.map(point => ({
+    ...point,
+    playbackSecond: Number.isFinite(startedAt)
+      ? Math.max(0, (new Date(point.recordedAt).getTime() - startedAt) / 1000)
+      : 0,
+  }))
+}
+
+const gpsPositionAt = (timeline, playbackTime) => {
+  if (!timeline.length) return null
+  const time = Math.max(0, Number(playbackTime) || 0)
+  if (time <= timeline[0].playbackSecond) return timeline[0]
+  if (time >= timeline.at(-1).playbackSecond) return timeline.at(-1)
+  const nextIndex = timeline.findIndex(point => point.playbackSecond >= time)
+  const previous = timeline[Math.max(0, nextIndex - 1)]
+  const next = timeline[nextIndex]
+  const span = Math.max(0.001, next.playbackSecond - previous.playbackSecond)
+  const ratio = Math.min(1, Math.max(0, (time - previous.playbackSecond) / span))
+  const interpolate = (left, right) => Number(left) + (Number(right) - Number(left)) * ratio
+  return {
+    ...previous,
+    latitude: interpolate(previous.latitude, next.latitude),
+    longitude: interpolate(previous.longitude, next.longitude),
+    speedMetersPerSecond: interpolate(previous.speedMetersPerSecond || 0, next.speedMetersPerSecond || 0),
+    accuracyMeters: interpolate(previous.accuracyMeters || 0, next.accuracyMeters || 0),
+    playbackSecond: time,
+  }
+}
+
+function GpsTrackMap({ items, startTime, playbackTime, onSeek }) {
   const containerRef = useRef(null)
+  const markerRef = useRef(null)
+  const progressLineRef = useRef(null)
+  const seekHandlerRef = useRef(onSeek)
+  const timeline = useMemo(() => gpsTimeline(items, startTime), [items, startTime])
+  const synchronized = Number.isFinite(playbackTime)
+
+  useEffect(() => { seekHandlerRef.current = onSeek }, [onSeek])
 
   useEffect(() => {
-    if (!containerRef.current || items.length === 0) return undefined
+    if (!containerRef.current || timeline.length === 0) return undefined
 
-    const coordinates = items.map(point => [point.latitude, point.longitude])
+    const coordinates = timeline.map(point => [point.latitude, point.longitude])
     const map = L.map(containerRef.current, {
       zoomControl: true,
       attributionControl: true,
@@ -168,13 +206,31 @@ function GpsTrackMap({ items }) {
       maxZoom: 19,
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
     }).addTo(map)
-    L.polyline(coordinates, {
-      color: '#8eea55',
+    const route = L.polyline(coordinates, {
+      color: synchronized ? '#607079' : '#8eea55',
       weight: 5,
-      opacity: 0.95,
+      opacity: synchronized ? 0.78 : 0.95,
       lineCap: 'round',
       lineJoin: 'round',
     }).addTo(map)
+    if (synchronized && seekHandlerRef.current) {
+      L.polyline(coordinates, { color: '#fff', weight: 22, opacity: 0.001 })
+        .addTo(map)
+        .on('click', event => {
+          const nearest = timeline.reduce((best, point) => {
+            const distance = map.distance(event.latlng, [point.latitude, point.longitude])
+            return !best || distance < best.distance ? { point, distance } : best
+          }, null)
+          if (nearest) seekHandlerRef.current?.(nearest.point.playbackSecond)
+        })
+      route.bindTooltip('Click the route to seek')
+      progressLineRef.current = L.polyline([], {
+        color: '#a9ff5c', weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round',
+      }).addTo(map)
+      markerRef.current = L.circleMarker(coordinates[0], {
+        radius: 8, color: '#111820', weight: 3, fillColor: '#ffd166', fillOpacity: 1,
+      }).addTo(map).bindTooltip('Current position')
+    }
     L.circleMarker(coordinates[0], {
       radius: 7,
       color: '#071018',
@@ -198,10 +254,65 @@ function GpsTrackMap({ items }) {
     }
     window.setTimeout(() => map.invalidateSize(), 0)
 
-    return () => map.remove()
-  }, [items])
+    return () => {
+      markerRef.current = null
+      progressLineRef.current = null
+      map.remove()
+    }
+  }, [timeline, synchronized])
+
+  useEffect(() => {
+    if (!synchronized || !markerRef.current || !progressLineRef.current || !timeline.length) return
+    const position = gpsPositionAt(timeline, playbackTime)
+    if (!position) return
+    const currentCoordinate = [position.latitude, position.longitude]
+    markerRef.current.setLatLng(currentCoordinate)
+    markerRef.current.setTooltipContent(`${formatTimelineDuration(playbackTime)} · ${(Number(position.speedMetersPerSecond || 0) * 3.6).toFixed(1)} km/h`)
+    const travelled = timeline
+      .filter(point => point.playbackSecond <= playbackTime)
+      .map(point => [point.latitude, point.longitude])
+    if (!travelled.length || travelled.at(-1)[0] !== currentCoordinate[0] || travelled.at(-1)[1] !== currentCoordinate[1]) travelled.push(currentCoordinate)
+    progressLineRef.current.setLatLngs(travelled)
+  }, [playbackTime, synchronized, timeline])
 
   return <div ref={containerRef} className="gps-track-map" aria-label="Recorded GPS route on OpenStreetMap" />
+}
+
+function MediaGpsPlayback({ type, recording, playbackTime, onSeek }) {
+  const [track, setTrack] = useState({ loading: true, error: '', items: [] })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setTrack({ loading: true, error: '', items: [] })
+    fetch(`${API}/api/${type}/${recording.id}/locations`, { signal: controller.signal })
+      .then(response => {
+        if (!response.ok) throw new Error(`GPS request failed (${response.status})`)
+        return response.json()
+      })
+      .then(result => setTrack({ loading: false, error: '', items: result.items || [] }))
+      .catch(error => {
+        if (error.name !== 'AbortError') setTrack({ loading: false, error: 'GPS track unavailable', items: [] })
+      })
+    return () => controller.abort()
+  }, [type, recording.id])
+
+  const timeline = useMemo(() => gpsTimeline(track.items, recording.startTime), [track.items, recording.startTime])
+  const position = useMemo(() => gpsPositionAt(timeline, playbackTime), [timeline, playbackTime])
+
+  return <aside className="gps-playback-panel">
+    <div className="gps-playback-heading"><strong>GPS playback</strong><span>Click route to seek</span></div>
+    {track.loading ? <div className="gps-playback-state"><div className="spinner" /><span>Loading GPS…</span></div>
+      : track.error ? <div className="gps-playback-state error">{track.error}</div>
+        : track.items.length === 0 ? <div className="gps-playback-state">No GPS points</div>
+          : <>
+            <GpsTrackMap items={track.items} startTime={recording.startTime} playbackTime={playbackTime} onSeek={onSeek} />
+            <div className="gps-playback-readout">
+              <span>Position<strong>{position ? `${position.latitude.toFixed(6)}, ${position.longitude.toFixed(6)}` : '--'}</strong></span>
+              <span>Speed<strong>{position ? `${(Number(position.speedMetersPerSecond || 0) * 3.6).toFixed(1)} km/h` : '--'}</strong></span>
+              <span>Accuracy<strong>{position ? `${Math.round(position.accuracyMeters || 0)} m` : '--'}</strong></span>
+            </div>
+          </>}
+  </aside>
 }
 
 function GpsTrackViewer({ track, onClose }) {
@@ -966,6 +1077,58 @@ function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlay
       </div>
     </div>
   </div>
+}
+
+function VideoPlaybackModal({ recording, onClose, onRotate }) {
+  const fullscreenRef = useRef(null)
+  const [playbackTime, setPlaybackTime] = useState(0)
+  const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
+  const hasGps = Number(recording.gpsPointCount) > 0
+  const seekFromMap = useCallback(time => {
+    setPlaybackTime(time)
+    setSeekRequest(current => ({ time, version: current.version + 1 }))
+  }, [])
+
+  return <div className="modal" onMouseDown={onClose}><div ref={fullscreenRef} className={`player media-playback-modal ${hasGps ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
+    <div><strong>{recording.originalFilename || recording.filename}</strong><span className="player-actions"><button className="rotate-control" title="Rotate playback clockwise by 90 degrees" onClick={() => onRotate(recording)}><Icon name="rotate" /><span>Rotate 90 deg</span></button><button className="close-player" aria-label="Close player" onClick={onClose}>X</button></span></div>
+    <div className="media-playback-grid">
+      <div className="media-playback-main">
+        <RotatedVideo
+          key={recording.id}
+          src={`${API}/api/videos/${recording.id}/stream`}
+          rotation={recording.playbackRotationDegrees || 0}
+          startTime={recording.startTime}
+          initialTime={seekRequest.time}
+          seekVersion={seekRequest.version}
+          onPlaybackTime={setPlaybackTime}
+          fullscreenTargetRef={hasGps ? fullscreenRef : undefined}
+        />
+        <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)} | Playback {recording.playbackRotationDegrees || 0} deg</p>
+      </div>
+      {hasGps && <MediaGpsPlayback type="videos" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+    </div>
+  </div></div>
+}
+
+function AudioPlaybackModal({ recording, onClose }) {
+  const [playbackTime, setPlaybackTime] = useState(0)
+  const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
+  const hasGps = Number(recording.gpsPointCount) > 0
+  const seekFromMap = useCallback(time => {
+    setPlaybackTime(time)
+    setSeekRequest(current => ({ time, version: current.version + 1 }))
+  }, [])
+
+  return <div className="modal" onMouseDown={onClose}><div className={`player media-playback-modal audio-player-modal ${hasGps ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
+    <div><strong>{recording.originalFilename || recording.filename}</strong><button className="close-player" aria-label="Close player" onClick={onClose}>X</button></div>
+    <div className="media-playback-grid">
+      <div className="media-playback-main">
+        <WaveformAudio key={recording.id} recording={recording} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} />
+        <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)}</p>
+      </div>
+      {hasGps && <MediaGpsPlayback type="audio" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+    </div>
+  </div></div>
 }
 
 function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
@@ -2697,7 +2860,7 @@ export default function App() {
 
   return <div className="shell">
     <header>
-      <div className="brand"><span className="brand-mark">DD</span><div><strong>Dashcam Diary</strong><small>Local video and audio library</small></div></div>
+      <div className="brand"><span className="brand-mark">DD</span><div><strong>Dashcam Diary Server</strong><small>Local video and audio library</small></div></div>
       <div className={`status ${online === true ? 'online' : online === false ? 'offline' : ''}`}>
         <span /> {online === true ? 'Server online' : online === false ? 'Server offline' : 'Checking server'}
       </div>
@@ -2705,7 +2868,7 @@ export default function App() {
 
     <main>
       <section className="hero">
-        <div><p className="eyebrow">LOCAL STORAGE</p><h1>Your Dashcam Diary.</h1><p>Browse, protect, and manage recordings uploaded from your phone.</p></div>
+        <div><p className="eyebrow">LOCAL SERVER</p><h1>Dashcam Diary Server.</h1><p>Browse, protect, and manage recordings uploaded from your phone.</p></div>
         <button className="refresh" onClick={refresh} disabled={loading}><Icon name="refresh" />Refresh</button>
       </section>
 
@@ -2992,21 +3155,13 @@ export default function App() {
         videoSegmentMinutes: result.segmentMinutes, startAlert: result.startAlert,
       } : device))}
     />}
-    {selected && <div className="modal" onMouseDown={() => setSelected(null)}><div className="player" onMouseDown={e => e.stopPropagation()}>
-      <div><strong>{selected.originalFilename || selected.filename}</strong><span className="player-actions"><button className="rotate-control" title="Rotate playback clockwise by 90 degrees" onClick={() => rotatePlayback(selected)}><Icon name="rotate" /><span>Rotate 90 deg</span></button><button className="close-player" aria-label="Close player" onClick={() => setSelected(null)}>X</button></span></div>
-      <RotatedVideo key={selected.id} src={`${API}/api/videos/${selected.id}/stream`} rotation={selected.playbackRotationDegrees || 0} startTime={selected.startTime} />
-      <p>{formatDate(selected.startTime)} | {formatDuration(selected.durationSeconds)} | {formatBytes(selected.fileSizeBytes)} | Playback {selected.playbackRotationDegrees || 0} deg</p>
-    </div></div>}
+    {selected && <VideoPlaybackModal recording={selected} onClose={() => setSelected(null)} onRotate={rotatePlayback} />}
     {selectedSession && <div className="modal" onMouseDown={() => setSelectedSession(null)}><div className="player" onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedSession.number} · {selectedSession.count} {selectedSession.count === 1 ? 'video' : 'videos'}</strong><span className="player-actions"><button className="close-player" aria-label="Close session player" onClick={() => setSelectedSession(null)}>X</button></span></div>
       <SessionPlayback key={selectedSession.number} session={selectedSession} />
       <p>{formatDate(selectedSession.videos[0].startTime)} to {formatDate(selectedSession.videos.at(-1).endTime)} | {formatTotalDuration(selectedSession.durationSeconds)} including short black intervals</p>
     </div></div>}
-    {selectedAudio && <div className="modal" onMouseDown={() => setSelectedAudio(null)}><div className="player audio-player-modal" onMouseDown={e => e.stopPropagation()}>
-      <div><strong>{selectedAudio.originalFilename || selectedAudio.filename}</strong><button className="close-player" aria-label="Close player" onClick={() => setSelectedAudio(null)}>X</button></div>
-      <WaveformAudio key={selectedAudio.id} recording={selectedAudio} />
-      <p>{formatDate(selectedAudio.startTime)} | {formatDuration(selectedAudio.durationSeconds)} | {formatBytes(selectedAudio.fileSizeBytes)}</p>
-    </div></div>}
+    {selectedAudio && <AudioPlaybackModal recording={selectedAudio} onClose={() => setSelectedAudio(null)} />}
     {selectedAudioSession && <div className="modal" onMouseDown={() => setSelectedAudioSession(null)}><div className="player audio-session-player" onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedAudioSession.number} | {selectedAudioSession.count} {selectedAudioSession.count === 1 ? 'recording' : 'recordings'}</strong><button className="close-player" aria-label="Close audio session player" onClick={() => setSelectedAudioSession(null)}>X</button></div>
       <AudioSessionPlayback key={selectedAudioSession.number} session={selectedAudioSession} />

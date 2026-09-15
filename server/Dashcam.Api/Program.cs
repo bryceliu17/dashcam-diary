@@ -3406,7 +3406,7 @@ static byte[] BuildGpx(string name, List<RecordingLocationPoint> points)
         writer.WriteStartDocument();
         writer.WriteStartElement("gpx", "http://www.topografix.com/GPX/1/1");
         writer.WriteAttributeString("version", "1.1");
-        writer.WriteAttributeString("creator", "Dashcam Diary");
+        writer.WriteAttributeString("creator", "Dashcam Diary Server");
         writer.WriteStartElement("trk");
         writer.WriteElementString("name", name);
         writer.WriteStartElement("trkseg");

@@ -573,7 +573,7 @@ class MainActivity : ComponentActivity() {
         settingsContainer.addView(serverUrlRow, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) })
 
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        previewRecordButton = actionButton(if (recording != null || continueRecording) "Stop Dashcam Diary" else "Start Dashcam Diary") {
+        previewRecordButton = actionButton(if (recording != null || continueRecording) "Stop Video" else "Start Video") {
             if (recording != null || continueRecording) {
                 stopDashcam("Stopped by user")
             } else if (!backgroundRecordingActive) {
@@ -583,7 +583,7 @@ class MainActivity : ComponentActivity() {
         controls.addView(previewRecordButton, LinearLayout.LayoutParams(-1, -1))
         root.addView(controls, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(12) })
         val backgroundControls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        backgroundRecordButton = actionButton(if (backgroundRecordingActive) "Stop Background" else "Start Background") {
+        backgroundRecordButton = actionButton(if (backgroundRecordingActive) "Stop Background Video" else "Start Background Video") {
             if (backgroundRecordingActive) {
                 stopBackgroundDashcam()
             } else if (recording == null && !continueRecording) {
@@ -2202,7 +2202,7 @@ class MainActivity : ComponentActivity() {
 
     private fun updateBackgroundRecordButton() {
         if (::backgroundRecordButton.isInitialized) {
-            backgroundRecordButton.text = if (backgroundRecordingActive) "Stop Background" else "Start Background"
+            backgroundRecordButton.text = if (backgroundRecordingActive) "Stop Background Video" else "Start Background Video"
             backgroundRecordButton.isEnabled = !liveStreaming && (
                 backgroundRecordingActive ||
                     (recording == null && !continueRecording && !audioRecordingActive)
@@ -2869,7 +2869,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (::previewRecordButton.isInitialized) {
-            previewRecordButton.text = if (active) "Stop Dashcam Diary" else "Start Dashcam Diary"
+            previewRecordButton.text = if (active) "Stop Video" else "Start Video"
             previewRecordButton.isEnabled = !liveStreaming && (
                 active ||
                     (!backgroundRecordingActive &&
