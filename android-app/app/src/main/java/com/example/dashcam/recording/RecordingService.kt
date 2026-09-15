@@ -1,5 +1,6 @@
 package com.example.dashcam.recording
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -8,6 +9,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.SurfaceTexture
 import android.os.BatteryManager
 import android.os.Build
@@ -34,6 +37,9 @@ import com.example.dashcam.MainActivity
 import com.example.dashcam.R
 import com.example.dashcam.data.DashcamDatabase
 import com.example.dashcam.data.VideoEntity
+import com.example.dashcam.location.GpsRecordingMode
+import com.example.dashcam.location.GpsRecordingSettings
+import com.example.dashcam.location.RecordingLocationTracker
 import com.example.dashcam.upload.UploadWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -42,6 +48,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
 
 class RecordingService : LifecycleService() {
@@ -51,10 +58,12 @@ class RecordingService : LifecycleService() {
     private var continueRecording = false
     private var segmentStart = 0L
     private var segmentFile: File? = null
+    private var segmentUuid: String? = null
     private var segmentDurationSeconds = 0
     private var stopMessage: String? = null
     private var startAlertPending = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private val locationTracker by lazy { RecordingLocationTracker(this) }
 
     // Monitoring-camera mode: do not stop recording automatically when power is
     // disconnected. Start/stop is controlled manually from the UI.
@@ -77,7 +86,7 @@ class RecordingService : LifecycleService() {
         when (intent?.action) {
             ACTION_STOP -> stopSafely("Stopped by user")
             else -> if (recording == null && !continueRecording) {
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startRecordingForeground()
                 // Monitoring-camera mode: allow manual recording on battery.
                 // if (!isCharging()) {
                 //     broadcastState(false, "Connect power before starting the dashcam")
@@ -121,6 +130,7 @@ class RecordingService : LifecycleService() {
                 val capture = bindCameraForRecording()
 
                 segmentStart = System.currentTimeMillis()
+                segmentUuid = UUID.randomUUID().toString()
                 segmentDurationSeconds = 0
                 val filename = SimpleDateFormat("'dashcam_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(segmentStart))
                 segmentFile = File(directory, filename)
@@ -136,6 +146,7 @@ class RecordingService : LifecycleService() {
     private fun handleVideoEvent(event: VideoRecordEvent) {
         when (event) {
             is VideoRecordEvent.Start -> {
+                segmentUuid?.let { locationTracker.start(it, "video", GpsRecordingSettings.videoMode(this)) }
                 updateSegmentDuration(event)
                 if (startAlertPending) {
                     startAlertPending = false
@@ -148,16 +159,20 @@ class RecordingService : LifecycleService() {
             is VideoRecordEvent.Finalize -> {
                 updateSegmentDuration(event)
                 val finishedFile = segmentFile
+                val finishedUuid = segmentUuid
+                val locationPoints = locationTracker.finish()
                 val startedAt = segmentStart
                 recording = null
                 segmentFile = null
-                if (finishedFile != null && finishedFile.length() > 0) {
+                segmentUuid = null
+                if (finishedFile != null && finishedUuid != null && finishedFile.length() > 0) {
                     val endedAt = System.currentTimeMillis()
                     val durationSeconds = segmentDurationSeconds.takeIf { it > 0 }
                         ?: ((endedAt - startedAt) / 1000).toInt().coerceAtLeast(1)
                     lifecycleScope.launch(Dispatchers.IO) {
                         DashcamDatabase.get(this@RecordingService).videoDao().insert(
                             VideoEntity(
+                                recordingUuid = finishedUuid,
                                 filename = finishedFile.name,
                                 localPath = finishedFile.absolutePath,
                                 startTime = startedAt,
@@ -166,6 +181,9 @@ class RecordingService : LifecycleService() {
                                 fileSizeBytes = finishedFile.length()
                             )
                         )
+                        if (locationPoints.isNotEmpty()) {
+                            DashcamDatabase.get(this@RecordingService).locationPointDao().insertAll(locationPoints)
+                        }
                         withContext(Dispatchers.Main) {
                             val message = if (event.hasError()) {
                                 "Saved ${finishedFile.name} after stop"
@@ -177,6 +195,7 @@ class RecordingService : LifecycleService() {
                         }
                     }
                 } else {
+                    locationTracker.cancel()
                     val stoppedByUser = !continueRecording && stopMessage != null
                     val error = if (stoppedByUser) {
                         stopMessage
@@ -288,6 +307,7 @@ class RecordingService : LifecycleService() {
         startAlertPending = false
         setRecordingPreference(false)
         cameraProvider?.unbindAll()
+        locationTracker.cancel()
         releaseWakeLock()
         UploadWorker.enqueueNow(this)
         stopForegroundCompat()
@@ -330,6 +350,19 @@ class RecordingService : LifecycleService() {
             pendingIntentFlags()
         )).build()
 
+    private fun startRecordingForeground() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            if (GpsRecordingSettings.videoMode(this) != GpsRecordingMode.Off &&
+                (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+            ) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIFICATION_ID, buildNotification(), types)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
@@ -365,6 +398,7 @@ class RecordingService : LifecycleService() {
         setRecordingPreference(false)
         cameraProvider?.unbindAll()
         recording?.close()
+        locationTracker.cancel()
         releaseWakeLock()
         cameraExecutor.shutdown()
         super.onDestroy()

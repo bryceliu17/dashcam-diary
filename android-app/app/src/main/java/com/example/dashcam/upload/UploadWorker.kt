@@ -201,9 +201,10 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     try {
                         val serverId = client.upload(
                             video,
-                            video.playbackRotationDegrees ?: defaultPlaybackRotation,
-                            sourceDeviceId,
-                            sourceDeviceName
+                        video.playbackRotationDegrees ?: defaultPlaybackRotation,
+                        sourceDeviceId,
+                        sourceDeviceName,
+                        database.locationPointDao().forRecording(video.recordingUuid)
                         )
                         videoDao.markUploaded(video.id, serverId, System.currentTimeMillis())
                         uploadedVideos += 1
@@ -236,7 +237,12 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     ) break
                     if (audioDao.markUploading(audio.id, System.currentTimeMillis()) == 0) continue
                     try {
-                        val serverId = client.uploadAudio(audio, sourceDeviceId, sourceDeviceName)
+                        val serverId = client.uploadAudio(
+                            audio,
+                            sourceDeviceId,
+                            sourceDeviceName,
+                            database.locationPointDao().forRecording(audio.recordingUuid)
+                        )
                         audioDao.markUploaded(audio.id, serverId, System.currentTimeMillis())
                         uploadedAudio += 1
                     } catch (cancelled: CancellationException) {

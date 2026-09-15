@@ -63,6 +63,9 @@ import com.example.dashcam.data.UploadStatus
 import com.example.dashcam.data.VideoEntity
 import com.example.dashcam.live.LiveAccessService
 import com.example.dashcam.live.LiveAccessSettings
+import com.example.dashcam.location.GpsRecordingMode
+import com.example.dashcam.location.GpsRecordingSettings
+import com.example.dashcam.location.RecordingLocationTracker
 import com.example.dashcam.network.DeviceStatusReporter
 import com.example.dashcam.network.ServerClient
 import com.example.dashcam.recording.BackgroundRecordingService
@@ -94,6 +97,7 @@ import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.abs
 
@@ -152,6 +156,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var backgroundVideoQualitySpinner: Spinner
     private lateinit var segmentDurationSpinner: Spinner
     private lateinit var audioSegmentDurationSpinner: Spinner
+    private lateinit var videoGpsModeSpinner: Spinner
+    private lateinit var audioGpsModeSpinner: Spinner
     private var suppressSegmentDurationSelection = false
     private var suppressAudioSegmentDurationSelection = false
     private lateinit var previewView: PreviewView
@@ -185,6 +191,8 @@ class MainActivity : ComponentActivity() {
     private var continueRecording = false
     private var segmentStart = 0L
     private var segmentFile: File? = null
+    private var segmentUuid: String? = null
+    private val locationTracker by lazy { RecordingLocationTracker(this) }
     private var segmentDurationSeconds = 0
     private var manualStartTime: Long? = null
     private var completedSegmentsSinceManualStart = 0
@@ -256,6 +264,14 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) enableLiveAccess() else toast("Camera permission is required for Live Access")
+    }
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        toast(if (granted) "Location recording enabled" else "Location permission denied; GPS recording remains off")
     }
 
     private val audioPlaybackRunnable = object : Runnable {
@@ -421,6 +437,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         RemoteRecordingControl.releasePreview = null
         if (recording != null || continueRecording) stopDashcam("Activity closed")
+        locationTracker.cancel()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
@@ -721,6 +738,56 @@ class MainActivity : ComponentActivity() {
             }
         }
         settingsContainer.addView(audioSegmentDurationSpinner, LinearLayout.LayoutParams(-1, dp(52)))
+        settingsContainer.addView(TextView(this).apply {
+            text = "Video GPS Tracking"
+            textSize = 12f
+            setTextColor(Color.rgb(75, 85, 99))
+            setPadding(0, dp(14), 0, dp(5))
+        })
+        videoGpsModeSpinner = ScrollFriendlySpinner(this).apply {
+            setBackgroundColor(Color.WHITE)
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                GpsRecordingMode.entries.map { it.label })
+            setSelection(GpsRecordingSettings.videoMode(this@MainActivity).ordinal, false)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    val mode = GpsRecordingMode.entries[position]
+                    if (GpsRecordingSettings.videoMode(this@MainActivity) == mode) return
+                    keepHomeScrollPosition {
+                        GpsRecordingSettings.setVideoMode(this@MainActivity, mode)
+                        requestLocationPermissionIfNeeded(mode)
+                        toast("Video GPS: ${mode.label}")
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+        }
+        settingsContainer.addView(videoGpsModeSpinner, LinearLayout.LayoutParams(-1, dp(52)))
+        settingsContainer.addView(TextView(this).apply {
+            text = "Audio GPS Tracking"
+            textSize = 12f
+            setTextColor(Color.rgb(75, 85, 99))
+            setPadding(0, dp(14), 0, dp(5))
+        })
+        audioGpsModeSpinner = ScrollFriendlySpinner(this).apply {
+            setBackgroundColor(Color.WHITE)
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                GpsRecordingMode.entries.map { it.label })
+            setSelection(GpsRecordingSettings.audioMode(this@MainActivity).ordinal, false)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    val mode = GpsRecordingMode.entries[position]
+                    if (GpsRecordingSettings.audioMode(this@MainActivity) == mode) return
+                    keepHomeScrollPosition {
+                        GpsRecordingSettings.setAudioMode(this@MainActivity, mode)
+                        requestLocationPermissionIfNeeded(mode)
+                        toast("Audio GPS: ${mode.label}")
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+        }
+        settingsContainer.addView(audioGpsModeSpinner, LinearLayout.LayoutParams(-1, dp(52)))
         val secondaryControls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         secondaryControls.addView(actionButton("Local Audio") {
             showLocalAudio()
@@ -1287,7 +1354,13 @@ class MainActivity : ComponentActivity() {
                 if (playingAudioPath == file.absolutePath) stopAudioPlayback()
                 lifecycleScope.launch(Dispatchers.IO) {
                     val deleted = file.delete()
-                    if (deleted) DashcamDatabase.get(this@MainActivity).audioDao().deleteByLocalPath(file.absolutePath)
+                    if (deleted) {
+                        val database = DashcamDatabase.get(this@MainActivity)
+                        database.audioDao().findByLocalPath(file.absolutePath)?.let {
+                            database.locationPointDao().deleteForRecording(it.recordingUuid)
+                        }
+                        database.audioDao().deleteByLocalPath(file.absolutePath)
+                    }
                     withContext(Dispatchers.Main) {
                         toast(if (deleted) "Deleted ${file.name}" else "Unable to delete ${file.name}")
                         showLocalAudio()
@@ -1306,9 +1379,13 @@ class MainActivity : ComponentActivity() {
                 stopAudioPlayback()
                 lifecycleScope.launch(Dispatchers.IO) {
                     val dao = DashcamDatabase.get(this@MainActivity).audioDao()
+                    val locationDao = DashcamDatabase.get(this@MainActivity).locationPointDao()
                     var deleted = 0
                     audioFiles.forEach {
                         if (it.file.delete()) {
+                            dao.findByLocalPath(it.file.absolutePath)?.let { audio ->
+                                locationDao.deleteForRecording(audio.recordingUuid)
+                            }
                             dao.deleteByLocalPath(it.file.absolutePath)
                             deleted += 1
                         }
@@ -1513,7 +1590,11 @@ class MainActivity : ComponentActivity() {
                 lifecycleScope.launch(Dispatchers.IO) {
                     val file = File(video.localPath)
                     val deleted = !file.exists() || file.delete()
-                    if (deleted) DashcamDatabase.get(this@MainActivity).videoDao().delete(video)
+                    if (deleted) {
+                        val database = DashcamDatabase.get(this@MainActivity)
+                        database.locationPointDao().deleteForRecording(video.recordingUuid)
+                        database.videoDao().delete(video)
+                    }
                     withContext(Dispatchers.Main) {
                         if (!deleted) {
                             toast("Unable to delete video file")
@@ -1544,11 +1625,13 @@ class MainActivity : ComponentActivity() {
                     var deletedCount = 0
                     var failedCount = 0
                     val dao = DashcamDatabase.get(this@MainActivity).videoDao()
+                    val locationDao = DashcamDatabase.get(this@MainActivity).locationPointDao()
 
                     videosToDelete.forEach { video ->
                         val file = File(video.localPath)
                         val deleted = !file.exists() || file.delete()
                         if (deleted) {
+                            locationDao.deleteForRecording(video.recordingUuid)
                             dao.delete(video)
                             deletedCount++
                         } else {
@@ -1579,6 +1662,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun weighted() = LinearLayout.LayoutParams(0, -1, 1f)
+
+    private fun requestLocationPermissionIfNeeded(mode: GpsRecordingMode) {
+        if (mode == GpsRecordingMode.Off) return
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            locationPermissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+        }
+    }
 
     private fun requestStart() {
         if (liveStreaming) {
@@ -1846,6 +1941,16 @@ class MainActivity : ComponentActivity() {
                 audioSegmentDurationSpinner.setSelection(position, false)
                 audioSegmentDurationSpinner.post { suppressAudioSegmentDurationSelection = false }
             }
+        }
+        if (::videoGpsModeSpinner.isInitialized) {
+            videoGpsModeSpinner.isEnabled = !liveStreaming && recording == null && !continueRecording && !backgroundRecordingActive
+            val position = GpsRecordingSettings.videoMode(this).ordinal
+            if (videoGpsModeSpinner.selectedItemPosition != position) videoGpsModeSpinner.setSelection(position, false)
+        }
+        if (::audioGpsModeSpinner.isInitialized) {
+            audioGpsModeSpinner.isEnabled = !liveStreaming && !audioRecordingActive
+            val position = GpsRecordingSettings.audioMode(this).ordinal
+            if (audioGpsModeSpinner.selectedItemPosition != position) audioGpsModeSpinner.setSelection(position, false)
         }
     }
 
@@ -2323,6 +2428,7 @@ class MainActivity : ComponentActivity() {
             try {
                 val capture = bindCameraForRecording()
                 segmentStart = System.currentTimeMillis()
+                segmentUuid = UUID.randomUUID().toString()
                 segmentDurationSeconds = 0
                 updateRecordingStatus()
                 val filename = SimpleDateFormat("'dashcam_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(segmentStart))
@@ -2410,6 +2516,9 @@ class MainActivity : ComponentActivity() {
     private fun handleVideoEvent(event: VideoRecordEvent) {
         when (event) {
             is VideoRecordEvent.Start -> {
+                segmentUuid?.let { uuid ->
+                    locationTracker.start(uuid, "video", GpsRecordingSettings.videoMode(this))
+                }
                 updateSegmentDuration(event)
                 runOnUiThread {
                     if (foregroundStartAlertPending) {
@@ -2429,24 +2538,30 @@ class MainActivity : ComponentActivity() {
                 updateSegmentDuration(event)
                 val finishedFile = segmentFile
                 val startedAt = segmentStart
+                val finishedUuid = segmentUuid
+                val locationPoints = locationTracker.finish()
                 recording = null
                 segmentFile = null
+                segmentUuid = null
 
-                if (finishedFile != null && finishedFile.length() > 0) {
+                if (finishedFile != null && finishedUuid != null && finishedFile.length() > 0) {
                     val endedAt = System.currentTimeMillis()
                     val durationSeconds = segmentDurationSeconds.takeIf { it > 0 }
                         ?: ((endedAt - startedAt) / 1000).toInt().coerceAtLeast(1)
                     lifecycleScope.launch(Dispatchers.IO) {
-                        DashcamDatabase.get(this@MainActivity).videoDao().insert(
+                        val database = DashcamDatabase.get(this@MainActivity)
+                        database.videoDao().insert(
                             VideoEntity(
                                 filename = finishedFile.name,
                                 localPath = finishedFile.absolutePath,
                                 startTime = startedAt,
                                 endTime = endedAt,
                                 durationSeconds = durationSeconds,
-                                fileSizeBytes = finishedFile.length()
+                                fileSizeBytes = finishedFile.length(),
+                                recordingUuid = finishedUuid
                             )
                         )
+                        if (locationPoints.isNotEmpty()) database.locationPointDao().insertAll(locationPoints)
                         withContext(Dispatchers.Main) {
                             if (continueRecording) completedSegmentsSinceManualStart += 1
                             if (stopAfterCurrentSegment) continueRecording = false
@@ -2526,6 +2641,8 @@ class MainActivity : ComponentActivity() {
         foregroundStartAlertPending = false
         stopAfterCurrentSegment = false
         mainHandler.removeCallbacks(timerRunnable)
+        locationTracker.cancel()
+        segmentUuid = null
         recording?.stop()
         cameraProvider?.unbindAll()
         setRecordingPreference(false)

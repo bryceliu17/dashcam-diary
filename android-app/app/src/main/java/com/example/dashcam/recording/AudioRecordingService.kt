@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Environment
@@ -21,6 +22,9 @@ import com.example.dashcam.MainActivity
 import com.example.dashcam.R
 import com.example.dashcam.data.AudioEntity
 import com.example.dashcam.data.DashcamDatabase
+import com.example.dashcam.location.GpsRecordingMode
+import com.example.dashcam.location.GpsRecordingSettings
+import com.example.dashcam.location.RecordingLocationTracker
 import com.example.dashcam.upload.UploadWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +36,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 class AudioRecordingService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -39,11 +44,13 @@ class AudioRecordingService : Service() {
     private var recorder: MediaRecorder? = null
     private var temporaryFile: File? = null
     private var finalFile: File? = null
+    private var recordingUuid: String? = null
     private var segmentStartMs = 0L
     private var recordingActive = false
     private var startAlertPending = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var remoteStartExpiresAt = 0L
+    private val locationTracker by lazy { RecordingLocationTracker(this) }
 
     private fun remoteStartAllowed() = remoteStartExpiresAt == 0L ||
         (RemoteRecordingControl.isEnabled(this) && System.currentTimeMillis() <= remoteStartExpiresAt)
@@ -68,7 +75,7 @@ class AudioRecordingService : Service() {
         if (intent?.hasExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT) == true &&
             (!RemoteRecordingControl.isEnabled(this) ||
                 System.currentTimeMillis() > intent.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0))) {
-            startForeground(NOTIFICATION_ID, buildNotification("Remote request cancelled"))
+            startRecordingForeground("Remote request cancelled")
             if (!recordingActive) finishService()
             return START_NOT_STICKY
         }
@@ -97,7 +104,7 @@ class AudioRecordingService : Service() {
             finishService()
             return
         }
-        startForeground(NOTIFICATION_ID, buildNotification("Starting audio recording"))
+        startRecordingForeground("Starting audio recording")
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             RemoteRecordingControl.audioRecordingError = "Microphone permission is required"
             finishService("Microphone permission is required")
@@ -133,6 +140,7 @@ class AudioRecordingService : Service() {
         val filename = SimpleDateFormat("'audio_'yyyyMMdd_HHmmss_SSS'.m4a'", Locale.US).format(Date(startedAt))
         val destination = File(directory, filename)
         val pending = File(directory, "$filename.recording")
+        val uuid = UUID.randomUUID().toString()
 
         var nextRecorder: MediaRecorder? = null
         try {
@@ -148,8 +156,10 @@ class AudioRecordingService : Service() {
             }
             temporaryFile = pending
             finalFile = destination
+            recordingUuid = uuid
             segmentStartMs = startedAt
             recorder = nextRecorder
+            locationTracker.start(uuid, "audio", GpsRecordingSettings.audioMode(this))
             remoteStartExpiresAt = 0L
             RemoteRecordingControl.audioRecorderStarted = true
             if (startAlertPending) {
@@ -186,11 +196,14 @@ class AudioRecordingService : Service() {
         val currentRecorder = recorder
         val pending = temporaryFile
         val destination = finalFile
+        val uuid = recordingUuid
+        val locationPoints = locationTracker.finish()
         val startedAt = segmentStartMs
         val endedAt = System.currentTimeMillis()
         recorder = null
         temporaryFile = null
         finalFile = null
+        recordingUuid = null
 
         var saved = false
         try {
@@ -201,11 +214,12 @@ class AudioRecordingService : Service() {
             try { currentRecorder?.release() } catch (_: RuntimeException) { }
         }
         if (!saved) pending?.delete()
-        if (saved && destination != null) {
+        if (saved && destination != null && uuid != null) {
             serviceScope.launch {
                 val durationSeconds = ((endedAt - startedAt) / 1000L).toInt().coerceAtLeast(1)
                 DashcamDatabase.get(this@AudioRecordingService).audioDao().insert(
                     AudioEntity(
+                        recordingUuid = uuid,
                         filename = destination.name,
                         localPath = destination.absolutePath,
                         startTime = startedAt,
@@ -214,6 +228,9 @@ class AudioRecordingService : Service() {
                         fileSizeBytes = destination.length()
                     )
                 )
+                if (locationPoints.isNotEmpty()) {
+                    DashcamDatabase.get(this@AudioRecordingService).locationPointDao().insertAll(locationPoints)
+                }
                 val deletedCount = AudioStoragePolicy.enforceLimit(
                     this@AudioRecordingService,
                     destination.parentFile ?: audioDirectory()
@@ -254,6 +271,8 @@ class AudioRecordingService : Service() {
         recorder = null
         temporaryFile = null
         finalFile = null
+        recordingUuid = null
+        locationTracker.cancel()
         finishService(message)
     }
 
@@ -313,6 +332,19 @@ class AudioRecordingService : Service() {
             .notify(NOTIFICATION_ID, buildNotification(text))
     }
 
+    private fun startRecordingForeground(text: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (GpsRecordingSettings.audioMode(this) != GpsRecordingMode.Off &&
+                (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+            ) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIFICATION_ID, buildNotification(text), types)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification(text))
+        }
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
@@ -355,6 +387,7 @@ class AudioRecordingService : Service() {
             temporaryFile?.delete()
         }
         recorder = null
+        locationTracker.cancel()
         PowerRecordingSettings.setAudioRecordingActive(this, false)
         releaseWakeLock()
         serviceScope.cancel()

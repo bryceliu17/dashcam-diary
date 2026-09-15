@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.SurfaceTexture
 import android.hardware.Camera
 import android.hardware.camera2.CameraCaptureSession
@@ -30,6 +31,9 @@ import com.example.dashcam.MainActivity
 import com.example.dashcam.R
 import com.example.dashcam.data.DashcamDatabase
 import com.example.dashcam.data.VideoEntity
+import com.example.dashcam.location.GpsRecordingMode
+import com.example.dashcam.location.GpsRecordingSettings
+import com.example.dashcam.location.RecordingLocationTracker
 import com.example.dashcam.upload.UploadWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +44,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 class BackgroundRecordingService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -55,11 +60,13 @@ class BackgroundRecordingService : Service() {
     private var captureSession: CameraCaptureSession? = null
     private var recorder: MediaRecorder? = null
     private var currentFile: File? = null
+    private var currentRecordingUuid: String? = null
     private var segmentStartMs = 0L
     private var continueRecording = false
     private var stopAfterCurrentSegmentRequested = false
     private var startAlertPending = false
     private var remoteStartExpiresAt = 0L
+    private val locationTracker by lazy { RecordingLocationTracker(this) }
 
     private fun remoteStartAllowed() = remoteStartExpiresAt == 0L ||
         (RemoteRecordingControl.isEnabled(this) && System.currentTimeMillis() <= remoteStartExpiresAt)
@@ -87,7 +94,7 @@ class BackgroundRecordingService : Service() {
         if (intent?.hasExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT) == true &&
             (!RemoteRecordingControl.isEnabled(this) ||
              System.currentTimeMillis() > intent.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0))) {
-            startForeground(NOTIFICATION_ID, buildNotification("Remote request cancelled"))
+            startRecordingForeground("Remote request cancelled")
             if (!continueRecording) finishService()
             return START_NOT_STICKY
         }
@@ -119,7 +126,7 @@ class BackgroundRecordingService : Service() {
         stopAfterCurrentSegmentRequested = false
         startAlertPending = true
         PowerRecordingSettings.setBackgroundRecordingActive(this, true)
-        startForeground(NOTIFICATION_ID, buildNotification("Starting background recording"))
+        startRecordingForeground("Starting background recording")
         broadcastState(true, 0, null)
         acquireWakeLock()
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
@@ -198,17 +205,20 @@ class BackgroundRecordingService : Service() {
             val startedAt = System.currentTimeMillis()
             val filename = SimpleDateFormat("'dashcam_bg_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(startedAt))
             val file = File(directory, filename)
+            val recordingUuid = UUID.randomUUID().toString()
 
             mainHandler.post {
                 if (!continueRecording || !remoteStartAllowed()) { failAndStop(); return@post }
                 try {
                     currentFile = file
+                    currentRecordingUuid = recordingUuid
                     segmentStartMs = startedAt
                     broadcastState(true, 0, file.name)
                     recorder = createLegacyRecorder(file, camera).also {
                         it.prepare()
                         it.start()
                     }
+                    locationTracker.start(recordingUuid, "video", GpsRecordingSettings.videoMode(this@BackgroundRecordingService))
                     showStartAlertOnce()
                     updateNotification("Background recording")
                     mainHandler.removeCallbacks(statusRunnable)
@@ -237,11 +247,13 @@ class BackgroundRecordingService : Service() {
             val startedAt = System.currentTimeMillis()
             val filename = SimpleDateFormat("'dashcam_bg_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(startedAt))
             val file = File(directory, filename)
+            val recordingUuid = UUID.randomUUID().toString()
 
             mainHandler.post {
                 if (!continueRecording || !remoteStartAllowed()) { failAndStop(); return@post }
                 try {
                     currentFile = file
+                    currentRecordingUuid = recordingUuid
                     segmentStartMs = startedAt
                     broadcastState(true, 0, file.name)
                     recorder = createRecorder(file).also { it.prepare() }
@@ -256,6 +268,7 @@ class BackgroundRecordingService : Service() {
                             captureSession = session
                             session.setRepeatingRequest(request.build(), null, cameraHandler)
                             recorder?.start()
+                            locationTracker.start(recordingUuid, "video", GpsRecordingSettings.videoMode(this@BackgroundRecordingService))
                             showStartAlertOnce()
                             updateNotification("Background recording")
                             mainHandler.removeCallbacks(statusRunnable)
@@ -383,6 +396,8 @@ class BackgroundRecordingService : Service() {
     private fun stopSegment(restart: Boolean) {
         mainHandler.removeCallbacks(rotateRunnable)
         val file = currentFile
+        val recordingUuid = currentRecordingUuid
+        val locationPoints = locationTracker.finish()
         val startedAt = segmentStartMs
 
         try {
@@ -407,14 +422,16 @@ class BackgroundRecordingService : Service() {
         } catch (_: Exception) {
         }
         currentFile = null
+        currentRecordingUuid = null
 
-        if (file != null && file.exists() && file.length() > 0) {
+        if (file != null && recordingUuid != null && file.exists() && file.length() > 0) {
             val endedAt = System.currentTimeMillis()
             val durationSeconds = ((endedAt - startedAt) / 1000).toInt().coerceAtLeast(1)
             broadcastState(restart && continueRecording, durationSeconds, file.name)
             scope.launch {
                 DashcamDatabase.get(this@BackgroundRecordingService).videoDao().insert(
                     VideoEntity(
+                        recordingUuid = recordingUuid,
                         filename = file.name,
                         localPath = file.absolutePath,
                         startTime = startedAt,
@@ -423,6 +440,9 @@ class BackgroundRecordingService : Service() {
                         fileSizeBytes = file.length()
                     )
                 )
+                if (locationPoints.isNotEmpty()) {
+                    DashcamDatabase.get(this@BackgroundRecordingService).locationPointDao().insertAll(locationPoints)
+                }
                 mainHandler.post { continueAfterSegment(restart) }
             }
         } else {
@@ -480,6 +500,7 @@ class BackgroundRecordingService : Service() {
         continueRecording = false
         stopAfterCurrentSegmentRequested = false
         currentFile?.delete()
+        locationTracker.cancel()
         broadcastState(false, 0, null, message)
         finishService()
     }
@@ -499,8 +520,10 @@ class BackgroundRecordingService : Service() {
         recorder?.release()
         recorder = null
         currentFile = null
+        currentRecordingUuid = null
         cameraDevice?.close()
         cameraDevice = null
+        locationTracker.cancel()
         try {
             legacyCamera?.stopPreview()
         } catch (_: Exception) {
@@ -535,6 +558,19 @@ class BackgroundRecordingService : Service() {
     private fun updateNotification(text: String) {
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    private fun startRecordingForeground(text: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            if (GpsRecordingSettings.videoMode(this) != GpsRecordingMode.Off &&
+                (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+            ) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIFICATION_ID, buildNotification(text), types)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification(text))
+        }
     }
 
     private fun createNotificationChannel() {

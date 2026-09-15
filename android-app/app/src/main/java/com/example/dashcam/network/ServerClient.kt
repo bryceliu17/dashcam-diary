@@ -1,6 +1,7 @@
 package com.example.dashcam.network
 
 import com.example.dashcam.data.AudioEntity
+import com.example.dashcam.data.LocationPointEntity
 import com.example.dashcam.data.VideoEntity
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -120,7 +121,8 @@ class ServerClient(private val baseUrl: String) {
         video: VideoEntity,
         playbackRotationDegrees: Int,
         sourceDeviceId: String,
-        sourceDeviceName: String
+        sourceDeviceName: String,
+        locationPoints: List<LocationPointEntity>
     ): Long {
         val file = File(video.localPath)
         require(file.exists()) { "Local file is missing: ${video.filename}" }
@@ -134,6 +136,8 @@ class ServerClient(private val baseUrl: String) {
             .addFormDataPart("playbackRotationDegrees", playbackRotationDegrees.toString())
             .addFormDataPart("sourceDeviceId", sourceDeviceId)
             .addFormDataPart("sourceDeviceName", sourceDeviceName)
+            .addFormDataPart("recordingUuid", video.recordingUuid)
+            .addFormDataPart("locationPoints", locationPointsJson(locationPoints))
             .build()
         val request = Request.Builder().url("${cleanBase()}/api/videos/upload")
             .header("Connection", "close")
@@ -147,7 +151,12 @@ class ServerClient(private val baseUrl: String) {
         }
     }
 
-    fun uploadAudio(audio: AudioEntity, sourceDeviceId: String, sourceDeviceName: String): Long {
+    fun uploadAudio(
+        audio: AudioEntity,
+        sourceDeviceId: String,
+        sourceDeviceName: String,
+        locationPoints: List<LocationPointEntity>
+    ): Long {
         val file = File(audio.localPath)
         require(file.exists()) { "Local file is missing: ${audio.filename}" }
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -159,6 +168,8 @@ class ServerClient(private val baseUrl: String) {
             .addFormDataPart("fileSizeBytes", file.length().toString())
             .addFormDataPart("sourceDeviceId", sourceDeviceId)
             .addFormDataPart("sourceDeviceName", sourceDeviceName)
+            .addFormDataPart("recordingUuid", audio.recordingUuid)
+            .addFormDataPart("locationPoints", locationPointsJson(locationPoints))
             .build()
         val request = Request.Builder().url("${cleanBase()}/api/audio/upload")
             .header("Connection", "close")
@@ -170,6 +181,22 @@ class ServerClient(private val baseUrl: String) {
             if (!response.isSuccessful) throw IllegalStateException("Server returned ${response.code}: ${text.take(300)}")
             return JSONObject(text).getLong("id")
         }
+    }
+
+    private fun locationPointsJson(points: List<LocationPointEntity>): String {
+        val values = org.json.JSONArray()
+        points.forEach { point ->
+            values.put(JSONObject()
+                .put("recordedAt", formatUtc(point.recordedAt))
+                .put("latitude", point.latitude)
+                .put("longitude", point.longitude)
+                .put("accuracyMeters", point.accuracyMeters.toDouble())
+                .put("speedMetersPerSecond", point.speedMetersPerSecond)
+                .put("bearingDegrees", point.bearingDegrees)
+                .put("altitudeMeters", point.altitudeMeters)
+                .put("provider", point.provider))
+        }
+        return values.toString()
     }
 
     fun updatePlaybackRotation(serverVideoId: Long, playbackRotationDegrees: Int) {

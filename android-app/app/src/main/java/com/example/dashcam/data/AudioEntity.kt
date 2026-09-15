@@ -1,11 +1,14 @@
 package com.example.dashcam.data
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.PrimaryKey
+import java.util.UUID
 
 @Entity(tableName = "audio_recordings")
 data class AudioEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(defaultValue = "''") val recordingUuid: String = UUID.randomUUID().toString(),
     val filename: String,
     val localPath: String,
     val startTime: Long,

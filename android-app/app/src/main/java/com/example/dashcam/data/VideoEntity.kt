@@ -1,13 +1,16 @@
 package com.example.dashcam.data
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.PrimaryKey
+import java.util.UUID
 
 enum class UploadStatus { Pending, Uploading, Uploaded, Failed }
 
 @Entity(tableName = "videos")
 data class VideoEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(defaultValue = "''") val recordingUuid: String = UUID.randomUUID().toString(),
     val filename: String,
     val localPath: String,
     val startTime: Long,
