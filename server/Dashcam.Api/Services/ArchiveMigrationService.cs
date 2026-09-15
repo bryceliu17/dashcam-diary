@@ -405,7 +405,14 @@ public sealed class ArchiveMigrationService
         records.AddRange(await ReadTableAsync(connection, "Videos", "video", videoRoot, videoIndex, token));
         if (await TableExistsAsync(connection, "AudioRecordings", token))
             records.AddRange(await ReadTableAsync(connection, "AudioRecordings", "audio", audioRoot, audioIndex, token));
-        return records;
+        if (!await TableExistsAsync(connection, "RecordingLocationPoints", token)) return records;
+        var locations = await ReadLocationPointsAsync(connection, token);
+        return records.Select(record => record with
+        {
+            LocationPoints = record.RecordingUuid is not null && locations.TryGetValue(record.RecordingUuid, out var points)
+                ? points
+                : []
+        }).ToList();
     }
 
     private static async Task<List<MigrationRecord>> ReadTableAsync(
@@ -425,7 +432,7 @@ public sealed class ArchiveMigrationService
                    {Column("StartTime", "''")}, {Column("EndTime", "[StartTime]")},
                    {Column("DurationSeconds", "0")}, {Column("FileSizeBytes", "0")}, {Column("Locked", "0")},
                    {Column("PlaybackRotationDegrees", "0")}, {Column("UploadedAt", "[StartTime]")},
-                   {Column("CreatedAt", "[StartTime]")}
+                   {Column("CreatedAt", "[StartTime]")}, {Column("RecordingUuid", "NULL")}
             FROM [{table}]
             ORDER BY [StartTime], [Id]
             """;
@@ -451,7 +458,9 @@ public sealed class ArchiveMigrationService
                 reader.GetBoolean(9),
                 kind == "video" ? reader.GetInt32(10) : 0,
                 ReadDate(reader.GetValue(11)),
-                ReadDate(reader.GetValue(12))));
+                ReadDate(reader.GetValue(12)),
+                reader.IsDBNull(13) ? null : reader.GetString(13),
+                []));
         }
         return records;
     }
@@ -469,7 +478,8 @@ public sealed class ArchiveMigrationService
             var sourceDeviceId = columns.Contains("SourceDeviceId") ? "SourceDeviceId" : "NULL";
             var sourceDeviceName = columns.Contains("SourceDeviceName") ? "SourceDeviceName" : "NULL";
             await using var command = connection.CreateCommand();
-            command.CommandText = $"SELECT Filename, OriginalFilename, FilePath, {sourceDeviceId}, {sourceDeviceName}, StartTime, EndTime, DurationSeconds, FileSizeBytes, Locked, {rotation}, UploadedAt, CreatedAt FROM {table}";
+            var recordingUuid = columns.Contains("RecordingUuid") ? "RecordingUuid" : "NULL";
+            command.CommandText = $"SELECT Filename, OriginalFilename, FilePath, {sourceDeviceId}, {sourceDeviceName}, StartTime, EndTime, DurationSeconds, FileSizeBytes, Locked, {rotation}, UploadedAt, CreatedAt, {recordingUuid} FROM {table}";
             await using var reader = await command.ExecuteReaderAsync(token);
             while (await reader.ReadAsync(token))
             {
@@ -479,13 +489,74 @@ public sealed class ArchiveMigrationService
                     reader.IsDBNull(4) ? null : reader.GetString(4),
                     ReadDate(reader.GetValue(5)), ReadDate(reader.GetValue(6)), reader.GetInt32(7),
                     reader.GetInt64(8), reader.GetBoolean(9), kind == "video" ? reader.GetInt32(10) : 0,
-                    ReadDate(reader.GetValue(11)), ReadDate(reader.GetValue(12)));
+                    ReadDate(reader.GetValue(11)), ReadDate(reader.GetValue(12)),
+                    reader.IsDBNull(13) ? null : reader.GetString(13), []);
                 var key = DuplicateKey(record);
                 if (!result.TryGetValue(key, out var paths)) result[key] = paths = [];
                 paths.Add(record.SourcePath!);
             }
         }
         return result;
+    }
+
+    private static async Task<Dictionary<string, List<MigrationLocationPoint>>> ReadLocationPointsAsync(
+        SqliteConnection connection,
+        CancellationToken token)
+    {
+        var result = new Dictionary<string, List<MigrationLocationPoint>>(StringComparer.OrdinalIgnoreCase);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT RecordingUuid, RecordedAt, Latitude, Longitude, AccuracyMeters,
+                   SpeedMetersPerSecond, BearingDegrees, AltitudeMeters, Provider
+            FROM RecordingLocationPoints
+            ORDER BY RecordingUuid, RecordedAt, Id
+            """;
+        await using var reader = await command.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            var uuid = reader.GetString(0);
+            if (!result.TryGetValue(uuid, out var points)) result[uuid] = points = [];
+            points.Add(new(
+                ReadDate(reader.GetValue(1)), reader.GetDouble(2), reader.GetDouble(3), reader.GetDouble(4),
+                reader.IsDBNull(5) ? null : reader.GetDouble(5),
+                reader.IsDBNull(6) ? null : reader.GetDouble(6),
+                reader.IsDBNull(7) ? null : reader.GetDouble(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8)));
+        }
+        return result;
+    }
+
+    private static async Task InsertLocationPointAsync(
+        SqliteConnection connection,
+        System.Data.Common.DbTransaction transaction,
+        MigrationRecord record,
+        int mediaId,
+        MigrationLocationPoint point,
+        CancellationToken token)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = (SqliteTransaction)transaction;
+        command.CommandText = """
+            INSERT INTO RecordingLocationPoints
+                (RecordingUuid, MediaType, VideoId, AudioRecordingId, RecordedAt, Latitude, Longitude,
+                 AccuracyMeters, SpeedMetersPerSecond, BearingDegrees, AltitudeMeters, Provider)
+            VALUES
+                ($uuid, $mediaType, $videoId, $audioId, $recordedAt, $latitude, $longitude,
+                 $accuracy, $speed, $bearing, $altitude, $provider)
+            """;
+        command.Parameters.AddWithValue("$uuid", record.RecordingUuid!);
+        command.Parameters.AddWithValue("$mediaType", record.Kind);
+        command.Parameters.AddWithValue("$videoId", record.Kind == "video" ? (object)mediaId : DBNull.Value);
+        command.Parameters.AddWithValue("$audioId", record.Kind == "audio" ? (object)mediaId : DBNull.Value);
+        command.Parameters.AddWithValue("$recordedAt", point.RecordedAt);
+        command.Parameters.AddWithValue("$latitude", point.Latitude);
+        command.Parameters.AddWithValue("$longitude", point.Longitude);
+        command.Parameters.AddWithValue("$accuracy", point.AccuracyMeters);
+        command.Parameters.AddWithValue("$speed", (object?)point.SpeedMetersPerSecond ?? DBNull.Value);
+        command.Parameters.AddWithValue("$bearing", (object?)point.BearingDegrees ?? DBNull.Value);
+        command.Parameters.AddWithValue("$altitude", (object?)point.AltitudeMeters ?? DBNull.Value);
+        command.Parameters.AddWithValue("$provider", (object?)point.Provider ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(token);
     }
 
     private static async Task InsertRecordAsync(SqliteConnection connection, System.Data.Common.DbTransaction transaction, PreparedImport item, CancellationToken token)
@@ -496,8 +567,8 @@ public sealed class ArchiveMigrationService
         {
             command.CommandText = """
                 INSERT INTO Videos (Filename, OriginalFilename, FilePath, StartTime, EndTime, DurationSeconds,
-                    FileSizeBytes, Locked, PlaybackRotationDegrees, UploadedAt, CreatedAt, SourceDeviceId, SourceDeviceName)
-                VALUES ($filename, $original, $path, $start, $end, $duration, $size, $locked, $rotation, $uploaded, $created, $sourceDeviceId, $sourceDeviceName)
+                    FileSizeBytes, Locked, PlaybackRotationDegrees, UploadedAt, CreatedAt, SourceDeviceId, SourceDeviceName, RecordingUuid, GpsPointCount)
+                VALUES ($filename, $original, $path, $start, $end, $duration, $size, $locked, $rotation, $uploaded, $created, $sourceDeviceId, $sourceDeviceName, $recordingUuid, $gpsPointCount)
                 """;
             command.Parameters.AddWithValue("$rotation", item.Record.PlaybackRotationDegrees);
         }
@@ -505,8 +576,8 @@ public sealed class ArchiveMigrationService
         {
             command.CommandText = """
                 INSERT INTO AudioRecordings (Filename, OriginalFilename, FilePath, StartTime, EndTime, DurationSeconds,
-                    FileSizeBytes, Locked, UploadedAt, CreatedAt, SourceDeviceId, SourceDeviceName)
-                VALUES ($filename, $original, $path, $start, $end, $duration, $size, $locked, $uploaded, $created, $sourceDeviceId, $sourceDeviceName)
+                    FileSizeBytes, Locked, UploadedAt, CreatedAt, SourceDeviceId, SourceDeviceName, RecordingUuid, GpsPointCount)
+                VALUES ($filename, $original, $path, $start, $end, $duration, $size, $locked, $uploaded, $created, $sourceDeviceId, $sourceDeviceName, $recordingUuid, $gpsPointCount)
                 """;
         }
         command.Parameters.AddWithValue("$filename", item.Filename);
@@ -514,6 +585,8 @@ public sealed class ArchiveMigrationService
         command.Parameters.AddWithValue("$path", item.FinalPath);
         command.Parameters.AddWithValue("$sourceDeviceId", (object?)item.Record.SourceDeviceId ?? DBNull.Value);
         command.Parameters.AddWithValue("$sourceDeviceName", (object?)item.Record.SourceDeviceName ?? DBNull.Value);
+        command.Parameters.AddWithValue("$recordingUuid", (object?)item.Record.RecordingUuid ?? DBNull.Value);
+        command.Parameters.AddWithValue("$gpsPointCount", item.Record.LocationPoints.Count);
         command.Parameters.AddWithValue("$start", item.Record.StartTime);
         command.Parameters.AddWithValue("$end", item.Record.EndTime);
         command.Parameters.AddWithValue("$duration", item.Record.DurationSeconds);
@@ -522,6 +595,15 @@ public sealed class ArchiveMigrationService
         command.Parameters.AddWithValue("$uploaded", item.Record.UploadedAt);
         command.Parameters.AddWithValue("$created", item.Record.CreatedAt);
         await command.ExecuteNonQueryAsync(token);
+        if (item.Record.RecordingUuid is null || item.Record.LocationPoints.Count == 0) return;
+        await using var idCommand = connection.CreateCommand();
+        idCommand.Transaction = (SqliteTransaction)transaction;
+        idCommand.CommandText = "SELECT last_insert_rowid()";
+        var mediaId = Convert.ToInt32(await idCommand.ExecuteScalarAsync(token), CultureInfo.InvariantCulture);
+        foreach (var point in item.Record.LocationPoints)
+        {
+            await InsertLocationPointAsync(connection, transaction, item.Record, mediaId, point, token);
+        }
     }
 
     private static async Task<ArchiveTotals> ReadCurrentTotalsAsync(string databasePath, CancellationToken token)
@@ -844,7 +926,18 @@ public sealed class ArchiveMigrationService
         bool Locked,
         int PlaybackRotationDegrees,
         DateTime UploadedAt,
-        DateTime CreatedAt);
+        DateTime CreatedAt,
+        string? RecordingUuid,
+        List<MigrationLocationPoint> LocationPoints);
+    private sealed record MigrationLocationPoint(
+        DateTime RecordedAt,
+        double Latitude,
+        double Longitude,
+        double AccuracyMeters,
+        double? SpeedMetersPerSecond,
+        double? BearingDegrees,
+        double? AltitudeMeters,
+        string? Provider);
     private sealed record PreparedImport(
         MigrationRecord Record,
         string Filename,

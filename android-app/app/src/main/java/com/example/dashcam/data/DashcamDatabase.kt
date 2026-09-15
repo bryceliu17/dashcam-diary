@@ -17,8 +17,8 @@ class Converters {
 }
 
 @Database(
-    entities = [VideoEntity::class, AudioEntity::class, BatteryTemperatureSample::class],
-    version = 6,
+    entities = [VideoEntity::class, AudioEntity::class, BatteryTemperatureSample::class, LocationPointEntity::class],
+    version = 7,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -26,6 +26,7 @@ abstract class DashcamDatabase : RoomDatabase() {
     abstract fun videoDao(): VideoDao
     abstract fun audioDao(): AudioDao
     abstract fun batteryTemperatureDao(): BatteryTemperatureDao
+    abstract fun locationPointDao(): LocationPointDao
 
     companion object {
         @Volatile private var instance: DashcamDatabase? = null
@@ -37,7 +38,8 @@ abstract class DashcamDatabase : RoomDatabase() {
                 MIGRATION_2_3,
                 MIGRATION_3_4,
                 MIGRATION_4_5,
-                MIGRATION_5_6
+                MIGRATION_5_6,
+                MIGRATION_6_7
             ).build().also { instance = it }
         }
 
@@ -119,6 +121,32 @@ abstract class DashcamDatabase : RoomDatabase() {
                       AND ABS(currentNowMicroamps) <= 20000
                     """.trimIndent()
                 )
+            }
+        }
+
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE videos ADD COLUMN recordingUuid TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE audio_recordings ADD COLUMN recordingUuid TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS location_points (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        recordingUuid TEXT NOT NULL,
+                        mediaType TEXT NOT NULL,
+                        recordedAt INTEGER NOT NULL,
+                        latitude REAL NOT NULL,
+                        longitude REAL NOT NULL,
+                        accuracyMeters REAL NOT NULL,
+                        speedMetersPerSecond REAL,
+                        bearingDegrees REAL,
+                        altitudeMeters REAL,
+                        provider TEXT
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_location_points_recordingUuid ON location_points (recordingUuid)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_location_points_recordedAt ON location_points (recordedAt)")
             }
         }
     }

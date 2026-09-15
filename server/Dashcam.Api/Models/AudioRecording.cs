@@ -3,6 +3,8 @@ namespace Dashcam.Api.Models;
 public sealed class AudioRecording
 {
     public int Id { get; set; }
+    public string? RecordingUuid { get; set; }
+    public int GpsPointCount { get; set; }
     public required string Filename { get; set; }
     public required string OriginalFilename { get; set; }
     public required string FilePath { get; set; }
@@ -27,4 +29,5 @@ public sealed class AudioRecording
     public DateTime? TranscriptCreatedAt { get; set; }
     public DateTime UploadedAt { get; set; }
     public DateTime CreatedAt { get; set; }
+    public ICollection<RecordingLocationPoint> LocationPoints { get; set; } = [];
 }

@@ -13,7 +13,8 @@ object StoragePolicy {
     }
 
     suspend fun prepareForRecordingWithResult(context: Context, videoDirectory: File): StoragePreparation {
-        val dao = DashcamDatabase.get(context).videoDao()
+        val database = DashcamDatabase.get(context)
+        val dao = database.videoDao()
         val maxVideoBytes = maxVideoBytes(context)
         var totalVideoBytes = dao.totalSize()
         var deletedCount = 0
@@ -25,7 +26,7 @@ object StoragePolicy {
             totalVideoBytes >= maxVideoBytes || videoDirectory.usableSpace < MIN_FREE_BYTES
         if (!initialCleanupRequired) return StoragePreparation(canRecord = true, deletedCount = 0)
 
-        if (!deleteOldestUnlockedVideo(dao)) {
+        if (!deleteOldestUnlockedVideo(database, dao)) {
             return StoragePreparation(canRecord = false, deletedCount = 0)
         }
         deletedCount += 1
@@ -35,7 +36,7 @@ object StoragePolicy {
         // segment can start below the limit. Free device space is intentionally not
         // rechecked here; it will be checked again before the following segment.
         while (totalVideoBytes >= maxVideoBytes) {
-            if (!deleteOldestUnlockedVideo(dao)) {
+            if (!deleteOldestUnlockedVideo(database, dao)) {
                 return StoragePreparation(canRecord = false, deletedCount = deletedCount)
             }
             deletedCount += 1
@@ -52,11 +53,13 @@ object StoragePolicy {
         StorageLimitSettings.videoLimitBytes(context, MAX_VIDEO_BYTES)
 
     private suspend fun deleteOldestUnlockedVideo(
+        database: DashcamDatabase,
         dao: com.example.dashcam.data.VideoDao
     ): Boolean {
         val candidate = dao.cleanupCandidatesForLocalStorage().firstOrNull() ?: return false
         val file = File(candidate.localPath)
         if (file.exists() && !file.delete()) return false
+        database.locationPointDao().deleteForRecording(candidate.recordingUuid)
         dao.delete(candidate)
         return true
     }

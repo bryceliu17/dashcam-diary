@@ -143,6 +143,47 @@ const recordingSourceKey = recording => recording?.sourceDeviceId
 
 const sourceLabel = recording => recording.sourceDeviceName?.trim() || 'No source'
 
+const gpsDistanceMeters = (first, second) => {
+  const radians = value => value * Math.PI / 180
+  const latitudeDelta = radians(second.latitude - first.latitude)
+  const longitudeDelta = radians(second.longitude - first.longitude)
+  const a = Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(radians(first.latitude)) * Math.cos(radians(second.latitude)) * Math.sin(longitudeDelta / 2) ** 2
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+function GpsTrackViewer({ track, onClose }) {
+  const items = track.items || []
+  const latitudes = items.map(point => point.latitude)
+  const longitudes = items.map(point => point.longitude)
+  const minLatitude = Math.min(...latitudes)
+  const maxLatitude = Math.max(...latitudes)
+  const minLongitude = Math.min(...longitudes)
+  const maxLongitude = Math.max(...longitudes)
+  const latitudeSpan = Math.max(maxLatitude - minLatitude, 0.00001)
+  const longitudeSpan = Math.max(maxLongitude - minLongitude, 0.00001)
+  const route = items.map(point => {
+    const x = 20 + (point.longitude - minLongitude) / longitudeSpan * 560
+    const y = 280 - (point.latitude - minLatitude) / latitudeSpan * 260
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+  const distance = items.slice(1).reduce((total, point, index) => total + gpsDistanceMeters(items[index], point), 0)
+  const maxSpeed = Math.max(0, ...items.map(point => Number(point.speedMetersPerSecond) || 0)) * 3.6
+  const first = items[0]
+  const last = items.at(-1)
+  const filename = track.recording.originalFilename || track.recording.filename
+
+  return <div className="modal" onMouseDown={onClose}><div className="player gps-track-modal" onMouseDown={event => event.stopPropagation()}>
+    <div><strong>GPS track · {filename}</strong><span className="player-actions">{items.length > 0 && <a className="transcript-download" href={`${API}/api/${track.type}/${track.recording.id}/locations/download`}><Icon name="download" />Download GPX</a>}<button className="close-player" aria-label="Close GPS track" onClick={onClose}>X</button></span></div>
+    {track.loading ? <div className="transcript-loading"><div className="spinner" /><span>Loading GPS track…</span></div> : track.error ? <div className="transcript-error">{track.error}</div> : items.length === 0 ? <div className="gps-track-empty">No GPS points were recorded for this file.</div> : <>
+      <div className="gps-track-summary"><span>Points<strong>{items.length}</strong></span><span>Distance<strong>{distance >= 1000 ? `${(distance / 1000).toFixed(2)} km` : `${Math.round(distance)} m`}</strong></span><span>Max speed<strong>{maxSpeed.toFixed(1)} km/h</strong></span><span>Accuracy<strong>{Math.round(items.at(-1).accuracyMeters)} m</strong></span></div>
+      <svg className="gps-track-chart" viewBox="0 0 600 300" role="img" aria-label="Recorded GPS route"><polyline points={route} /><circle className="start" cx={route.split(' ')[0]?.split(',')[0]} cy={route.split(' ')[0]?.split(',')[1]} r="6"/><circle className="end" cx={route.split(' ').at(-1)?.split(',')[0]} cy={route.split(' ').at(-1)?.split(',')[1]} r="6"/></svg>
+      <div className="gps-track-endpoints"><span>Start<strong>{first.latitude.toFixed(6)}, {first.longitude.toFixed(6)}</strong><small>{formatDate(first.recordedAt)}</small></span><span>End<strong>{last.latitude.toFixed(6)}, {last.longitude.toFixed(6)}</strong><small>{formatDate(last.recordedAt)}</small></span></div>
+      <a className="gps-open-map" target="_blank" rel="noreferrer" href={`https://www.openstreetmap.org/?mlat=${first.latitude}&mlon=${first.longitude}#map=17/${first.latitude}/${first.longitude}`}>Open starting point in OpenStreetMap</a>
+    </>}
+  </div></div>
+}
+
 function RecordingNoteEditor({ editor, saving, onClose, onSave }) {
   const [note, setNote] = useState(editor.initialNote)
   const count = editor.ids.length
@@ -224,6 +265,7 @@ function Icon({ name }) {
     close: <path d="M6 6l12 12M18 6 6 18"/>,
     chevronLeft: <path d="m15 18-6-6 6-6"/>,
     chevronRight: <path d="m9 18 6-6-6-6"/>,
+    location: <><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></>,
   }
   return <svg viewBox="0 0 24 24" aria-hidden="true">{icons[name]}</svg>
 }
@@ -1803,6 +1845,7 @@ export default function App() {
   const [selectedAudio, setSelectedAudio] = useState(null)
   const [selectedAudioSession, setSelectedAudioSession] = useState(null)
   const [selectedTranscript, setSelectedTranscript] = useState(null)
+  const [gpsTrack, setGpsTrack] = useState(null)
   const [noteEditor, setNoteEditor] = useState(null)
   const [noteSaving, setNoteSaving] = useState(false)
   const [liveDeviceId, setLiveDeviceId] = useState(null)
@@ -2361,6 +2404,16 @@ export default function App() {
     }
   }
 
+  const viewGpsTrack = async (type, recording) => {
+    setGpsTrack({ type, recording, loading: true, error: '', items: [] })
+    try {
+      const result = await api(`/api/${type}/${recording.id}/locations`)
+      setGpsTrack({ type, recording, loading: false, error: '', items: result.items || [] })
+    } catch (err) {
+      setGpsTrack({ type, recording, loading: false, error: err.message, items: [] })
+    }
+  }
+
   const renameTranscriptSpeakers = async (recording, names) => {
     setError('')
     try {
@@ -2813,6 +2866,7 @@ export default function App() {
               <td><span className={`pill ${video.locked ? 'locked' : ''}`}>{video.locked ? 'Locked' : 'Unlocked'}</span></td>
               <td><div className="actions">
                 <button title="Play" onClick={() => setSelected(video)}><Icon name="play" /></button>
+                <button title={video.gpsPointCount > 0 ? `View ${video.gpsPointCount} GPS points` : 'No GPS track'} disabled={!video.gpsPointCount} onClick={() => viewGpsTrack('videos', video)}><Icon name="location" /></button>
                 <a
                   className={rotatingVideoIds.has(video.id) ? 'disabled' : ''}
                   title={rotatingVideoIds.has(video.id) ? 'Saving rotation…' : 'Download'}
@@ -2856,6 +2910,7 @@ export default function App() {
               </div></td>
               <td><div className="actions">
                 <button title="Play" onClick={() => setSelectedAudio(recording)}><Icon name="play" /></button>
+                <button title={recording.gpsPointCount > 0 ? `View ${recording.gpsPointCount} GPS points` : 'No GPS track'} disabled={!recording.gpsPointCount} onClick={() => viewGpsTrack('audio', recording)}><Icon name="location" /></button>
                 <a title="Download" href={`${API}/api/audio/${recording.id}/download`}><Icon name="download" /></a>
                 <button
                   className={['queued', 'processing'].includes(recording.transcriptStatus) ? 'exporting' : ''}
@@ -2919,6 +2974,7 @@ export default function App() {
       <p>{formatDate(selectedAudioSession.recordings[0].startTime)} to {formatDate(selectedAudioSession.recordings.at(-1).endTime)} | {formatTotalDuration(selectedAudioSession.durationSeconds)} including short silent intervals</p>
     </div></div>}
     {selectedTranscript && <TranscriptViewer transcript={selectedTranscript} onClose={() => setSelectedTranscript(null)} onDelete={deleteAudioTranscript} onRenameSpeakers={renameTranscriptSpeakers} />}
+    {gpsTrack && <GpsTrackViewer track={gpsTrack} onClose={() => setGpsTrack(null)} />}
     {noteEditor && <RecordingNoteEditor key={`${noteEditor.type}:${noteEditor.ids.join(',')}`} editor={noteEditor} saving={noteSaving} onClose={() => setNoteEditor(null)} onSave={saveRecordingNote} />}
     {liveDevice && <LiveViewer device={liveDevice} onClose={options => stopLive(liveDevice.deviceId, options)} onTorch={enabled => setLiveTorch(liveDevice.deviceId, enabled)} onCamera={facing => setLiveCamera(liveDevice.deviceId, facing)} />}
     {batteryHistory && <BatteryHistoryModal state={batteryHistory} onRange={hours => loadBatteryHistory(batteryHistory.device, hours)} onClose={closeBatteryHistory} />}

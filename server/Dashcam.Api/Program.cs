@@ -103,6 +103,7 @@ await using (var scope = app.Services.CreateAsyncScope())
     await EnsureDeviceStatusTableAsync(db);
     await EnsureRecordingSourceColumnsAsync(db);
     await EnsureRecordingNotesAsync(db);
+    await EnsureRecordingLocationSchemaAsync(db);
     await db.Database.ExecuteSqlRawAsync(
         "UPDATE AudioRecordings SET TranscriptStatus = 'failed', TranscriptError = 'Transcription was interrupted by a server restart.' WHERE TranscriptStatus IN ('queued', 'processing')");
     await db.Database.ExecuteSqlRawAsync(
@@ -568,6 +569,22 @@ app.MapPost("/api/videos/upload", async (
 
     var sourceDeviceId = CleanNullableText(form["sourceDeviceId"].FirstOrDefault(), 128);
     var sourceDeviceName = CleanNullableText(form["sourceDeviceName"].FirstOrDefault(), 160);
+    if (!TryNormalizeRecordingUuid(form["recordingUuid"].FirstOrDefault(), out var recordingUuid))
+        return Results.BadRequest(new { error = "recordingUuid must be a valid UUID." });
+    if (!TryParseLocationPoints(form["locationPoints"].FirstOrDefault(), startTime, endTime, out var uploadedLocations, out var locationError))
+        return Results.BadRequest(new { error = locationError });
+    if (recordingUuid is null && uploadedLocations.Count > 0)
+        return Results.BadRequest(new { error = "recordingUuid is required when locationPoints are supplied." });
+
+    if (recordingUuid is not null)
+    {
+        var existingByUuid = await db.Videos.SingleOrDefaultAsync(x => x.RecordingUuid == recordingUuid, cancellationToken);
+        if (existingByUuid is not null)
+        {
+            await AddVideoLocationsIfMissingAsync(db, existingByUuid, uploadedLocations, cancellationToken);
+            return Results.Ok(ToResponse(existingByUuid));
+        }
+    }
 
     var storageRoot = GetStorageRoot(configuration);
     var dateDirectory = Path.Combine(storageRoot, startTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
@@ -594,8 +611,10 @@ app.MapPost("/api/videos/upload", async (
             {
                 duplicate.SourceDeviceId = sourceDeviceId;
                 duplicate.SourceDeviceName = sourceDeviceName;
-                await db.SaveChangesAsync(cancellationToken);
             }
+            if (duplicate.RecordingUuid is null) duplicate.RecordingUuid = recordingUuid;
+            await AddVideoLocationsIfMissingAsync(db, duplicate, uploadedLocations, cancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
             loggerFactory.CreateLogger("Dashcam.UploadDeduplication").LogInformation(
                 "Discarded duplicate video upload {OriginalFilename}; returning existing video {VideoId}",
                 originalFilename,
@@ -607,6 +626,8 @@ app.MapPost("/api/videos/upload", async (
         var video = new Video
         {
             Filename = storedFilename,
+            RecordingUuid = recordingUuid,
+            GpsPointCount = uploadedLocations.Count,
             OriginalFilename = originalFilename,
             FilePath = finalPath,
             SourceDeviceId = sourceDeviceId,
@@ -621,6 +642,14 @@ app.MapPost("/api/videos/upload", async (
             CreatedAt = now
         };
         db.Videos.Add(video);
+        if (recordingUuid is not null && uploadedLocations.Count > 0)
+        {
+            var locations = uploadedLocations
+                .Select(point => ToLocationEntity(point, recordingUuid, "video", null, null))
+                .ToList();
+            locations.ForEach(point => point.Video = video);
+            db.RecordingLocationPoints.AddRange(locations);
+        }
         await db.SaveChangesAsync(cancellationToken);
 
         try
@@ -686,6 +715,22 @@ app.MapPost("/api/audio/upload", async (
 
     var sourceDeviceId = CleanNullableText(form["sourceDeviceId"].FirstOrDefault(), 128);
     var sourceDeviceName = CleanNullableText(form["sourceDeviceName"].FirstOrDefault(), 160);
+    if (!TryNormalizeRecordingUuid(form["recordingUuid"].FirstOrDefault(), out var recordingUuid))
+        return Results.BadRequest(new { error = "recordingUuid must be a valid UUID." });
+    if (!TryParseLocationPoints(form["locationPoints"].FirstOrDefault(), startTime, endTime, out var uploadedLocations, out var locationError))
+        return Results.BadRequest(new { error = locationError });
+    if (recordingUuid is null && uploadedLocations.Count > 0)
+        return Results.BadRequest(new { error = "recordingUuid is required when locationPoints are supplied." });
+
+    if (recordingUuid is not null)
+    {
+        var existingByUuid = await db.AudioRecordings.SingleOrDefaultAsync(x => x.RecordingUuid == recordingUuid, cancellationToken);
+        if (existingByUuid is not null)
+        {
+            await AddAudioLocationsIfMissingAsync(db, existingByUuid, uploadedLocations, cancellationToken);
+            return Results.Ok(ToAudioResponse(existingByUuid));
+        }
+    }
 
     var storageRoot = GetAudioStorageRoot(configuration);
     var dateDirectory = Path.Combine(storageRoot, startTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
@@ -711,8 +756,10 @@ app.MapPost("/api/audio/upload", async (
             {
                 duplicate.SourceDeviceId = sourceDeviceId;
                 duplicate.SourceDeviceName = sourceDeviceName;
-                await db.SaveChangesAsync(cancellationToken);
             }
+            if (duplicate.RecordingUuid is null) duplicate.RecordingUuid = recordingUuid;
+            await AddAudioLocationsIfMissingAsync(db, duplicate, uploadedLocations, cancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
             loggerFactory.CreateLogger("Dashcam.UploadDeduplication").LogInformation(
                 "Discarded duplicate audio upload {OriginalFilename}; returning existing audio {AudioId}",
                 originalFilename,
@@ -724,6 +771,8 @@ app.MapPost("/api/audio/upload", async (
         var audio = new AudioRecording
         {
             Filename = storedFilename,
+            RecordingUuid = recordingUuid,
+            GpsPointCount = uploadedLocations.Count,
             OriginalFilename = originalFilename,
             FilePath = finalPath,
             SourceDeviceId = sourceDeviceId,
@@ -737,6 +786,14 @@ app.MapPost("/api/audio/upload", async (
             CreatedAt = now
         };
         db.AudioRecordings.Add(audio);
+        if (recordingUuid is not null && uploadedLocations.Count > 0)
+        {
+            var locations = uploadedLocations
+                .Select(point => ToLocationEntity(point, recordingUuid, "audio", null, null))
+                .ToList();
+            locations.ForEach(point => point.AudioRecording = audio);
+            db.RecordingLocationPoints.AddRange(locations);
+        }
         await db.SaveChangesAsync(cancellationToken);
 
         try
@@ -1085,6 +1142,25 @@ app.MapPatch("/api/audio/{id:int}/source", async (
     audio.SourceDeviceName = CleanNullableText(request.SourceDeviceName, 160);
     await db.SaveChangesAsync(token);
     return Results.Ok(ToAudioResponse(audio));
+});
+
+app.MapGet("/api/audio/{id:int}/locations", async (int id, DashcamDbContext db, CancellationToken token) =>
+{
+    var audio = await db.AudioRecordings.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
+    if (audio is null) return Results.NotFound();
+    var points = await db.RecordingLocationPoints.AsNoTracking()
+        .Where(x => x.AudioRecordingId == id).OrderBy(x => x.RecordedAt).ToListAsync(token);
+    return Results.Ok(ToLocationResponse(audio.RecordingUuid, "audio", points));
+});
+
+app.MapGet("/api/audio/{id:int}/locations/download", async (int id, DashcamDbContext db, CancellationToken token) =>
+{
+    var audio = await db.AudioRecordings.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
+    if (audio is null) return Results.NotFound();
+    var points = await db.RecordingLocationPoints.AsNoTracking()
+        .Where(x => x.AudioRecordingId == id).OrderBy(x => x.RecordedAt).ToListAsync(token);
+    if (points.Count == 0) return Results.NotFound(new { error = "This recording has no GPS track." });
+    return Results.File(BuildGpx(audio.OriginalFilename, points), "application/gpx+xml", $"{Path.GetFileNameWithoutExtension(audio.OriginalFilename)}.gpx");
 });
 
 app.MapPatch("/api/audio/{id:int}/note", async (
@@ -1591,6 +1667,25 @@ app.MapPatch("/api/videos/{id:int}/source", async (
     video.SourceDeviceName = CleanNullableText(request.SourceDeviceName, 160);
     await db.SaveChangesAsync(token);
     return Results.Ok(ToResponse(video));
+});
+
+app.MapGet("/api/videos/{id:int}/locations", async (int id, DashcamDbContext db, CancellationToken token) =>
+{
+    var video = await db.Videos.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
+    if (video is null) return Results.NotFound();
+    var points = await db.RecordingLocationPoints.AsNoTracking()
+        .Where(x => x.VideoId == id).OrderBy(x => x.RecordedAt).ToListAsync(token);
+    return Results.Ok(ToLocationResponse(video.RecordingUuid, "video", points));
+});
+
+app.MapGet("/api/videos/{id:int}/locations/download", async (int id, DashcamDbContext db, CancellationToken token) =>
+{
+    var video = await db.Videos.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
+    if (video is null) return Results.NotFound();
+    var points = await db.RecordingLocationPoints.AsNoTracking()
+        .Where(x => x.VideoId == id).OrderBy(x => x.RecordedAt).ToListAsync(token);
+    if (points.Count == 0) return Results.NotFound(new { error = "This recording has no GPS track." });
+    return Results.File(BuildGpx(video.OriginalFilename, points), "application/gpx+xml", $"{Path.GetFileNameWithoutExtension(video.OriginalFilename)}.gpx");
 });
 
 app.MapPatch("/api/videos/{id:int}/note", async (
@@ -2606,6 +2701,43 @@ static async Task EnsureRecordingNotesAsync(DashcamDbContext db)
     await EnsureColumnAsync(db, "AudioRecordings", "Note", "TEXT NOT NULL DEFAULT ''");
 }
 
+static async Task EnsureRecordingLocationSchemaAsync(DashcamDbContext db)
+{
+    await EnsureColumnAsync(db, "Videos", "RecordingUuid", "TEXT NULL");
+    await EnsureColumnAsync(db, "Videos", "GpsPointCount", "INTEGER NOT NULL DEFAULT 0");
+    await EnsureColumnAsync(db, "AudioRecordings", "RecordingUuid", "TEXT NULL");
+    await EnsureColumnAsync(db, "AudioRecordings", "GpsPointCount", "INTEGER NOT NULL DEFAULT 0");
+    await db.Database.ExecuteSqlRawAsync("""
+        CREATE TABLE IF NOT EXISTS RecordingLocationPoints (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            RecordingUuid TEXT NOT NULL,
+            MediaType TEXT NOT NULL,
+            VideoId INTEGER NULL,
+            AudioRecordingId INTEGER NULL,
+            RecordedAt TEXT NOT NULL,
+            Latitude REAL NOT NULL,
+            Longitude REAL NOT NULL,
+            AccuracyMeters REAL NOT NULL,
+            SpeedMetersPerSecond REAL NULL,
+            BearingDegrees REAL NULL,
+            AltitudeMeters REAL NULL,
+            Provider TEXT NULL,
+            FOREIGN KEY (VideoId) REFERENCES Videos (Id) ON DELETE CASCADE,
+            FOREIGN KEY (AudioRecordingId) REFERENCES AudioRecordings (Id) ON DELETE CASCADE
+        )
+        """);
+    await db.Database.ExecuteSqlRawAsync(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_Videos_RecordingUuid ON Videos (RecordingUuid)");
+    await db.Database.ExecuteSqlRawAsync(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_AudioRecordings_RecordingUuid ON AudioRecordings (RecordingUuid)");
+    await db.Database.ExecuteSqlRawAsync(
+        "CREATE INDEX IF NOT EXISTS IX_RecordingLocationPoints_RecordingUuid_RecordedAt ON RecordingLocationPoints (RecordingUuid, RecordedAt)");
+    await db.Database.ExecuteSqlRawAsync(
+        "CREATE INDEX IF NOT EXISTS IX_RecordingLocationPoints_VideoId ON RecordingLocationPoints (VideoId)");
+    await db.Database.ExecuteSqlRawAsync(
+        "CREATE INDEX IF NOT EXISTS IX_RecordingLocationPoints_AudioRecordingId ON RecordingLocationPoints (AudioRecordingId)");
+}
+
 static async Task<bool> EnsureColumnAsync(DashcamDbContext db, string table, string column, string definition)
 {
     var connection = db.Database.GetDbConnection();
@@ -2877,6 +3009,8 @@ static string FormatTranscriptTimestamp(double seconds)
 static object ToResponse(Video video) => new
 {
     video.Id,
+    video.RecordingUuid,
+    video.GpsPointCount,
     video.Filename,
     video.OriginalFilename,
     video.SourceDeviceId,
@@ -2895,6 +3029,8 @@ static object ToResponse(Video video) => new
 static object ToAudioResponse(AudioRecording audio) => new
 {
     audio.Id,
+    audio.RecordingUuid,
+    audio.GpsPointCount,
     audio.Filename,
     audio.OriginalFilename,
     audio.SourceDeviceId,
@@ -3142,6 +3278,156 @@ static string? CleanNullableText(string? value, int maxLength)
     return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength];
 }
 
+static bool TryNormalizeRecordingUuid(string? value, out string? normalized)
+{
+    normalized = null;
+    if (string.IsNullOrWhiteSpace(value)) return true;
+    if (!Guid.TryParse(value.Trim(), out var parsed)) return false;
+    normalized = parsed.ToString("D");
+    return true;
+}
+
+static bool TryParseLocationPoints(
+    string? json,
+    DateTime startTime,
+    DateTime endTime,
+    out List<UploadedLocationPoint> points,
+    out string error)
+{
+    points = [];
+    error = string.Empty;
+    if (string.IsNullOrWhiteSpace(json)) return true;
+    try
+    {
+        points = JsonSerializer.Deserialize<List<UploadedLocationPoint>>(
+            json,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+    }
+    catch (JsonException)
+    {
+        error = "locationPoints must be a valid JSON array.";
+        return false;
+    }
+    if (points.Count > 100_000)
+    {
+        error = "A recording cannot contain more than 100,000 location points.";
+        return false;
+    }
+    var earliest = AsUtc(startTime).AddMinutes(-15);
+    var latest = AsUtc(endTime).AddMinutes(15);
+    foreach (var point in points)
+    {
+        var recordedAt = AsUtc(point.RecordedAt);
+        if (recordedAt < earliest || recordedAt > latest ||
+            !double.IsFinite(point.Latitude) || !double.IsFinite(point.Longitude) ||
+            point.Latitude is < -90 or > 90 || point.Longitude is < -180 or > 180 ||
+            !double.IsFinite(point.AccuracyMeters) || point.AccuracyMeters is < 0 or > 100_000 ||
+            point.SpeedMetersPerSecond is < 0 or > 500 ||
+            point.BearingDegrees is < 0 or > 360 ||
+            (point.AltitudeMeters.HasValue && !double.IsFinite(point.AltitudeMeters.Value)))
+        {
+            error = "locationPoints contains an invalid coordinate, timestamp or measurement.";
+            return false;
+        }
+    }
+    points = points.OrderBy(point => AsUtc(point.RecordedAt)).ToList();
+    return true;
+}
+
+static RecordingLocationPoint ToLocationEntity(
+    UploadedLocationPoint point,
+    string recordingUuid,
+    string mediaType,
+    int? videoId,
+    int? audioRecordingId) => new()
+{
+    RecordingUuid = recordingUuid,
+    MediaType = mediaType,
+    VideoId = videoId,
+    AudioRecordingId = audioRecordingId,
+    RecordedAt = AsUtc(point.RecordedAt),
+    Latitude = point.Latitude,
+    Longitude = point.Longitude,
+    AccuracyMeters = point.AccuracyMeters,
+    SpeedMetersPerSecond = point.SpeedMetersPerSecond,
+    BearingDegrees = point.BearingDegrees,
+    AltitudeMeters = point.AltitudeMeters,
+    Provider = CleanNullableText(point.Provider, 32)
+};
+
+static async Task AddVideoLocationsIfMissingAsync(
+    DashcamDbContext db,
+    Video video,
+    List<UploadedLocationPoint> points,
+    CancellationToken token)
+{
+    if (video.RecordingUuid is null || video.GpsPointCount > 0 || points.Count == 0) return;
+    db.RecordingLocationPoints.AddRange(points.Select(point => ToLocationEntity(point, video.RecordingUuid, "video", video.Id, null)));
+    video.GpsPointCount = points.Count;
+    await db.SaveChangesAsync(token);
+}
+
+static async Task AddAudioLocationsIfMissingAsync(
+    DashcamDbContext db,
+    AudioRecording audio,
+    List<UploadedLocationPoint> points,
+    CancellationToken token)
+{
+    if (audio.RecordingUuid is null || audio.GpsPointCount > 0 || points.Count == 0) return;
+    db.RecordingLocationPoints.AddRange(points.Select(point => ToLocationEntity(point, audio.RecordingUuid, "audio", null, audio.Id)));
+    audio.GpsPointCount = points.Count;
+    await db.SaveChangesAsync(token);
+}
+
+static object ToLocationResponse(string? recordingUuid, string mediaType, List<RecordingLocationPoint> points) => new
+{
+    recordingUuid,
+    mediaType,
+    count = points.Count,
+    items = points.Select(point => new
+    {
+        recordedAt = AsUtc(point.RecordedAt),
+        point.Latitude,
+        point.Longitude,
+        point.AccuracyMeters,
+        point.SpeedMetersPerSecond,
+        point.BearingDegrees,
+        point.AltitudeMeters,
+        point.Provider
+    })
+};
+
+static byte[] BuildGpx(string name, List<RecordingLocationPoint> points)
+{
+    using var output = new MemoryStream();
+    var settings = new System.Xml.XmlWriterSettings { Encoding = new UTF8Encoding(false), Indent = true };
+    using (var writer = System.Xml.XmlWriter.Create(output, settings))
+    {
+        writer.WriteStartDocument();
+        writer.WriteStartElement("gpx", "http://www.topografix.com/GPX/1/1");
+        writer.WriteAttributeString("version", "1.1");
+        writer.WriteAttributeString("creator", "Dashcam Diary");
+        writer.WriteStartElement("trk");
+        writer.WriteElementString("name", name);
+        writer.WriteStartElement("trkseg");
+        foreach (var point in points)
+        {
+            writer.WriteStartElement("trkpt");
+            writer.WriteAttributeString("lat", point.Latitude.ToString("R", CultureInfo.InvariantCulture));
+            writer.WriteAttributeString("lon", point.Longitude.ToString("R", CultureInfo.InvariantCulture));
+            if (point.AltitudeMeters.HasValue)
+                writer.WriteElementString("ele", point.AltitudeMeters.Value.ToString("R", CultureInfo.InvariantCulture));
+            writer.WriteElementString("time", AsUtc(point.RecordedAt).ToString("O", CultureInfo.InvariantCulture));
+            writer.WriteEndElement();
+        }
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        writer.WriteEndDocument();
+    }
+    return output.ToArray();
+}
+
 static bool TryNormalizeNote(string? value, out string note)
 {
     note = value?.Trim() ?? string.Empty;
@@ -3177,6 +3463,15 @@ public sealed record BulkRecordingNoteRequest(int[] Ids, string? Note);
 public sealed record BulkRotationRequest(int[] Ids, int PlaybackRotationDegrees);
 public sealed record RotationRequest(int PlaybackRotationDegrees);
 public sealed record RecordingSourceRequest(string? SourceDeviceId, string? SourceDeviceName);
+public sealed record UploadedLocationPoint(
+    DateTime RecordedAt,
+    double Latitude,
+    double Longitude,
+    double AccuracyMeters,
+    double? SpeedMetersPerSecond,
+    double? BearingDegrees,
+    double? AltitudeMeters,
+    string? Provider);
 public sealed record ArchiveStorageSettingsRequest(double MaxVideoStorageGb, double MaxAudioStorageGb);
 public sealed record MobileUploadSettingsRequest(bool AcceptMobileUploads);
 public sealed record VideoExportRequest(int[] Ids, bool WithTimestamp, int TimezoneOffsetMinutes);

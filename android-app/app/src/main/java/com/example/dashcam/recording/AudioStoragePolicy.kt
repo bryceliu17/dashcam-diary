@@ -11,7 +11,8 @@ object AudioStoragePolicy {
         StorageLimitSettings.audioLimitBytes(context, MAX_AUDIO_BYTES)
 
     suspend fun enforceLimit(context: Context, audioDirectory: File): Int {
-        val dao = DashcamDatabase.get(context).audioDao()
+        val database = DashcamDatabase.get(context)
+        val dao = database.audioDao()
         val lockedPaths = dao.lockedPaths().toHashSet()
         val allRecordings = audioDirectory.listFiles()
             .orEmpty()
@@ -27,6 +28,9 @@ object AudioStoragePolicy {
             if (totalBytes <= maxAudioBytes) break
             val fileSize = recording.length()
             if (recording.delete()) {
+                dao.findByLocalPath(recording.absolutePath)?.let {
+                    database.locationPointDao().deleteForRecording(it.recordingUuid)
+                }
                 dao.deleteByLocalPath(recording.absolutePath)
                 totalBytes = (totalBytes - fileSize).coerceAtLeast(0)
                 deletedCount += 1

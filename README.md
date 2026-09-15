@@ -46,6 +46,8 @@ Recording timestamps are saved in UTC. The dashboard displays them in the browse
 - Video segment choices: 1, 3, 5, or 10 minutes, unlimited, or a custom duration. Default: 5 minutes.
 - Audio segment choices: 5, 10, 15, 30, or 60 minutes, unlimited, or a custom duration. Default: 30 minutes.
 - Video and audio are mutually exclusive.
+- On `main`, video and audio have independent, optional GPS modes: **Off**, **Dashcam (3 s / 10 m)**, **Bodycam (5 s / 5 m)**, **Audio diary (60 s / 100 m)**, and **Battery saver (15 s / 25 m)**. GPS is off by default and requires location permission.
+- Every media segment owns its own GPS track. Local cleanup or deletion removes that segment's points with it; uploaded tracks follow the same media record on the server.
 - Local video/audio lists support status, playback, seeking, rotation where applicable, locking, and deletion.
 - The launcher icon remains available, but the app is excluded from Android's recent-apps screen to reduce accidental swipe-away closures.
 
@@ -90,6 +92,7 @@ Start alerts are configured independently of the recording mode. The choices are
 - Range-enabled playback, playback rotation, original downloads, timestamp-overlay video downloads, and session downloads/exports.
 - Group nearby recordings into sessions for continuous video or audio playback while retaining individual controls.
 - Video and audio rows show their source device. The source can be changed to another known device, `Unknown`, or blank; session grouping never crosses a source-device boundary.
+- Recordings with GPS data expose a route summary in the dashboard and can download their track as a GPX file. The dashboard does not contact a third-party map provider unless the user opens the supplied OpenStreetMap link.
 - Bulk select, lock/unlock, rotate videos, and delete recordings.
 - Audio waveform generation and caching through `ffmpeg`.
 - One-click transcription for audio recordings up to 30 minutes, with language detection, timestamped `Speaker 1` / `Speaker 2` separation, transcript viewing, TXT download, and transcript deletion without deleting the audio. Docker runs `faster-whisper` plus optional local `pyannote.audio` speaker diarization, configured for CUDA by default.
@@ -105,8 +108,8 @@ Server cleanup is independent of the phone's own rotating archive: after uploads
 Requirements: Docker Desktop. The included transcription container is configured to use an NVIDIA CUDA GPU; remove or adapt its GPU settings in `compose.yaml` if transcription should run differently.
 
 ```powershell
-git clone https://github.com/bryceliu17/dashcam.git
-cd dashcam
+git clone https://github.com/bryceliu17/dashcam-diary.git
+cd dashcam-diary
 docker compose up -d --build
 ```
 
@@ -240,7 +243,7 @@ Switch back with `git switch main` before building or deploying the maintained s
 - Background camera, charging detection, Wi-Fi behavior, and key events vary by phone manufacturer, firmware, lock-screen state, heat, and battery policy.
 - Video bitrate, frame rate, low-light behavior, and resulting file size depend on each device camera/encoder.
 - Live Access is intended for on-demand viewing, not as a security-camera replacement.
-- The project does not currently include GPS, collision detection, cloud storage, multi-user accounts, named speaker recognition, or automated Android integration tests.
+- The project does not currently include collision detection, cloud storage, multi-user accounts, named speaker recognition, or automated Android integration tests.
 
 ---
 
@@ -286,6 +289,8 @@ React 管理页面（Docker 默认端口 8080）
 - 视频分段可选 1、3、5、10 分钟、无限或自定义；默认 5 分钟。
 - 音频分段可选 5、10、15、30、60 分钟、无限或自定义；默认 30 分钟。
 - 视频和音频不能同时录制。
+- `main` 的视频和音频可以分别选择 GPS 模式：**关闭**、**行车记录（3 秒 / 10 米）**、**执法记录（5 秒 / 5 米）**、**音频日记（60 秒 / 100 米）**和**省电（15 秒 / 25 米）**。GPS 默认关闭，启用时需要位置权限。
+- 每个视频或音频片段都有自己独立的 GPS 轨迹；手机本地覆盖或删除该文件时会同时删除其定位点，上传后也与服务端对应文件绑定。
 - 本地视频/音频列表支持状态、播放、拖动、适用时的旋转、锁定和删除。
 - 桌面启动图标仍然保留，但 App 不显示在 Android 最近任务中，以减少清理其他 App 时被误划掉的概率。
 
@@ -330,6 +335,7 @@ React 管理页面（Docker 默认端口 8080）
 - 支持 Range 播放、播放旋转、原视频下载、带时间戳的视频下载，以及 session 下载/导出。
 - 将相邻录制分组为 session 连续播放，同时保留单个文件控制。
 - 视频和音频会显示来源设备；网页可改成其他已知设备、`Unknown` 或留空，session 不会跨不同来源设备分组。
+- 有 GPS 数据的文件可以在网页端查看轨迹摘要并下载 GPX；只有用户主动打开 OpenStreetMap 链接时，浏览器才会访问第三方地图服务。
 - 支持多选、批量锁定/解锁、批量旋转视频和批量删除。
 - 使用 `ffmpeg` 生成和缓存音频波形。
 - 最长 30 分钟的音频可以一键转文字，支持语言识别、带时间的 `Speaker 1` / `Speaker 2` 说话人分离、查看文字稿、下载 TXT 和单独删除文字稿而不删除音频。Docker 默认使用 CUDA 运行 `faster-whisper`，并可在本机使用 `pyannote.audio` 进行说话人分离。
@@ -345,8 +351,8 @@ React 管理页面（Docker 默认端口 8080）
 需要 Docker Desktop。附带的转文字容器默认配置为使用 NVIDIA CUDA GPU；如果希望以其他方式转写，需要相应修改 `compose.yaml` 中的 GPU 设置。
 
 ```powershell
-git clone https://github.com/bryceliu17/dashcam.git
-cd dashcam
+git clone https://github.com/bryceliu17/dashcam-diary.git
+cd dashcam-diary
 docker compose up -d --build
 ```
 
@@ -480,4 +486,4 @@ cd android-app
 - 后台相机、充电检测、Wi-Fi、按键行为会受手机厂商、固件、锁屏、温度和省电策略影响。
 - 视频码率、帧率、夜视效果和文件大小都依赖手机本身的相机/编码器。
 - Live Access 适合按需查看，不是安全摄像头的替代方案。
-- 当前没有 GPS、碰撞检测、云存储、多用户账号、实名说话人识别或 Android 自动化集成测试。
+- 当前没有碰撞检测、云存储、多用户账号、实名说话人识别或 Android 自动化集成测试。
