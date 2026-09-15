@@ -13,7 +13,7 @@ web-dashboard/dist/
 .env
 .env.*
 !.env.example
-data/
+/data/
 
 # Android / Gradle
 **/.gradle/
