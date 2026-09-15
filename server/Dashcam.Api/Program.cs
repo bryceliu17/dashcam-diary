@@ -1009,14 +1009,16 @@ app.MapPatch("/api/audio/{id:int}/transcription/speakers", async (
 });
 
 app.MapGet("/api/audio/{id:int}/transcription/download", async (
-    int id, DashcamDbContext db, CancellationToken token) =>
+    int id, string? timeMode, int? timezoneOffsetMinutes, DashcamDbContext db, CancellationToken token) =>
 {
     var audio = await db.AudioRecordings.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
     if (audio is null) return Results.NotFound();
     if (audio.TranscriptStatus != "ready")
         return Results.Conflict(new { error = "The transcript is not ready." });
 
-    var text = BuildTranscriptFile(audio);
+    var useRecordedTimes = string.Equals(timeMode, "recorded", StringComparison.OrdinalIgnoreCase);
+    var offsetMinutes = Math.Clamp(timezoneOffsetMinutes ?? 0, -840, 840);
+    var text = BuildTranscriptFile(audio, useRecordedTimes, offsetMinutes);
     var preamble = Encoding.UTF8.GetPreamble();
     var content = Encoding.UTF8.GetBytes(text);
     var bytes = new byte[preamble.Length + content.Length];
@@ -2814,7 +2816,7 @@ static object ToTranscriptResponse(AudioRecording audio, bool includeText)
     };
 }
 
-static string BuildTranscriptFile(AudioRecording audio)
+static string BuildTranscriptFile(AudioRecording audio, bool useRecordedTimes = false, int timezoneOffsetMinutes = 0)
 {
     var language = string.IsNullOrWhiteSpace(audio.TranscriptLanguage) ? "Unknown" : audio.TranscriptLanguage;
     var probability = audio.TranscriptLanguageProbability > 0
@@ -2828,11 +2830,12 @@ static string BuildTranscriptFile(AudioRecording audio)
             var segments = JsonSerializer.Deserialize<List<AudioTranscriptSegment>>(
                 audio.TranscriptSegmentsJson,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
-            if (segments.Any(segment => !string.IsNullOrWhiteSpace(segment.Speaker)))
+            if (segments.Count > 0)
             {
                 transcript = string.Join(Environment.NewLine, segments.Select(segment =>
-                    $"[{FormatTranscriptTimestamp(segment.Start)} - {FormatTranscriptTimestamp(segment.End)}] " +
-                    $"{segment.Speaker}: {segment.Text}"));
+                    $"[{FormatTranscriptTime(audio, segment.Start, useRecordedTimes, timezoneOffsetMinutes)} - " +
+                    $"{FormatTranscriptTime(audio, segment.End, useRecordedTimes, timezoneOffsetMinutes)}] " +
+                    $"{(string.IsNullOrWhiteSpace(segment.Speaker) ? string.Empty : $"{segment.Speaker}: ")}{segment.Text}"));
             }
         }
         catch (JsonException)
@@ -2846,12 +2849,22 @@ static string BuildTranscriptFile(AudioRecording audio)
     return $"""
         Audio: {audio.OriginalFilename}
         Recorded: {AsUtc(audio.StartTime):yyyy-MM-dd HH:mm:ss} UTC
+        Timeline: {(useRecordedTimes ? "recorded clock time" : "audio-relative time")}
         Language: {language}{probability}
         Model: {audio.TranscriptModel}
         Speakers: {speakers}
 
         {transcript}
         """;
+}
+
+static string FormatTranscriptTime(AudioRecording audio, double seconds, bool useRecordedTimes, int timezoneOffsetMinutes)
+{
+    if (!useRecordedTimes) return FormatTranscriptTimestamp(seconds);
+    return AsUtc(audio.StartTime)
+        .AddMinutes(-timezoneOffsetMinutes)
+        .AddSeconds(Math.Max(0, seconds))
+        .ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
 }
 
 static string FormatTranscriptTimestamp(double seconds)

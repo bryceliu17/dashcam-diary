@@ -141,38 +141,7 @@ const recordingSourceKey = recording => recording?.sourceDeviceId
     ? `name:${recording.sourceDeviceName.trim().toLowerCase()}`
     : 'blank'
 
-function SourceSelect({ recording, devices, disabled, onChange }) {
-  const currentDevice = recording.sourceDeviceId
-    ? devices.find(device => device.deviceId === recording.sourceDeviceId)
-    : null
-  const name = recording.sourceDeviceName?.trim() || ''
-  const value = recording.sourceDeviceId
-    ? `device:${recording.sourceDeviceId}`
-    : name.toLowerCase() === 'unknown'
-      ? 'unknown'
-      : name
-        ? `name:${name}`
-        : 'blank'
-  const customValue = value.startsWith('name:') || (value.startsWith('device:') && !currentDevice)
-
-  const select = event => {
-    const selected = event.target.value
-    if (selected === 'blank') onChange({ sourceDeviceId: null, sourceDeviceName: null })
-    else if (selected === 'unknown') onChange({ sourceDeviceId: null, sourceDeviceName: 'Unknown' })
-    else if (selected.startsWith('device:')) {
-      const deviceId = selected.slice('device:'.length)
-      const device = devices.find(item => item.deviceId === deviceId)
-      onChange({ sourceDeviceId: deviceId, sourceDeviceName: device?.deviceName || recording.sourceDeviceName || 'Unknown' })
-    }
-  }
-
-  return <select className="source-select" value={value} onChange={select} disabled={disabled} aria-label="Recording source">
-    <option value="blank">No source</option>
-    <option value="unknown">Unknown</option>
-    {devices.map(device => <option key={device.deviceId} value={`device:${device.deviceId}`}>{device.deviceName}</option>)}
-    {customValue && <option value={value}>{name || recording.sourceDeviceId}</option>}
-  </select>
-}
+const sourceLabel = recording => recording.sourceDeviceName?.trim() || 'No source'
 
 function RecordingNoteEditor({ editor, saving, onClose, onSave }) {
   const [note, setNote] = useState(editor.initialNote)
@@ -922,6 +891,7 @@ function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState(null)
   const [waveformExpanded, setWaveformExpanded] = useState(false)
+  const [timestampMode, setTimestampMode] = useState('relative')
   const [editingSpeakers, setEditingSpeakers] = useState(false)
   const [speakerNames, setSpeakerNames] = useState({})
   const [speakerSaving, setSpeakerSaving] = useState(false)
@@ -929,6 +899,8 @@ function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
   const hasSpeakerLabels = segments.some(segment => segment.speaker)
   const speakers = [...new Set(segments.map(segment => segment.speaker).filter(Boolean))]
   const speakerKey = speakers.join('\u0000')
+  const usesRecordedClock = timestampMode === 'recorded'
+  const transcriptDownloadUrl = `${API}/api/audio/${transcript.recording.id}/transcription/download?timeMode=${usesRecordedClock ? 'recorded' : 'relative'}&timezoneOffsetMinutes=${new Date().getTimezoneOffset()}`
 
   useEffect(() => {
     setSpeakerNames(Object.fromEntries(speakers.map(speaker => [speaker, speaker])))
@@ -945,15 +917,18 @@ function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
   }
 
   return <div className="modal" onMouseDown={() => !transcript.deleting && onClose()}><div className="player transcript-modal" onMouseDown={event => event.stopPropagation()}>
-    <div><strong>{transcript.recording.originalFilename || transcript.recording.filename}</strong><span className="player-actions">{transcript.status === 'ready' && <><a className="transcript-download" href={`${API}/api/audio/${transcript.recording.id}/transcription/download`}><Icon name="download" />Download TXT</a><button type="button" className="transcript-delete" disabled={transcript.deleting} onClick={() => onDelete(transcript.recording)}><Icon name="trash" />{transcript.deleting ? 'Deleting…' : 'Delete transcript'}</button></>}<button className="close-player" aria-label="Close transcript" disabled={transcript.deleting} onClick={onClose}>X</button></span></div>
+    <div><strong>{transcript.recording.originalFilename || transcript.recording.filename}</strong><span className="player-actions">{transcript.status === 'ready' && <><a className="transcript-download" href={transcriptDownloadUrl}><Icon name="download" />Download TXT</a><button type="button" className="transcript-delete" disabled={transcript.deleting} onClick={() => onDelete(transcript.recording)}><Icon name="trash" />{transcript.deleting ? 'Deleting…' : 'Delete transcript'}</button></>}<button className="close-player" aria-label="Close transcript" disabled={transcript.deleting} onClick={onClose}>X</button></span></div>
     {transcript.loading ? <div className="transcript-loading"><div className="spinner" /><span>Loading transcript…</span></div> : transcript.error ? <div className="transcript-error">{transcript.error}</div> : <div className="transcript-body">
       <div className="transcript-meta"><span>Language <strong>{transcript.language || 'Unknown'}{transcript.languageProbability ? ` · ${Math.round(transcript.languageProbability * 100)}%` : ''}</strong></span><span>Model <strong>{transcript.model || '—'}</strong></span><span>Speakers <strong>{transcript.diarizationStatus === 'ready' ? (transcript.speakerCount || 'No speech') : transcript.diarizationStatus === 'failed' ? 'Unavailable' : 'Not configured'}</strong></span></div>
       {transcript.diarizationStatus !== 'ready' && <p className="transcript-diarization-note">{transcript.diarizationStatus === 'failed' ? `Speaker separation failed${transcript.diarizationError ? `: ${transcript.diarizationError}` : '.'}` : 'Speaker separation was not configured when this transcript was generated.'}</p>}
+      <div className="transcript-time-mode"><span>Timeline</span><button type="button" className={usesRecordedClock ? '' : 'active'} onClick={() => setTimestampMode('relative')}>Audio time</button><button type="button" className={usesRecordedClock ? 'active' : ''} onClick={() => setTimestampMode('recorded')}>Recorded clock</button></div>
       <div className={`transcript-player ${waveformExpanded ? '' : 'collapsed'}`}><div className="transcript-player-toolbar"><strong>Audio playback</strong><button type="button" onClick={() => setWaveformExpanded(current => !current)}>{waveformExpanded ? 'Hide waveform' : 'Show waveform'}</button></div><WaveformAudio recording={transcript.recording} autoPlay={false} showWaveform={waveformExpanded} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} /></div>
       {hasSpeakerLabels && <section className="transcript-speaker-editor"><div><strong>Speaker names</strong><small>Applies to every matching line and TXT download.</small></div>{editingSpeakers ? <><div className="transcript-speaker-fields">{speakers.map(speaker => <label key={speaker}><span>{speaker}</span><input value={speakerNames[speaker] ?? speaker} maxLength="120" onChange={event => setSpeakerNames(current => ({ ...current, [speaker]: event.target.value }))} aria-label={`Name for ${speaker}`} /></label>)}</div><div className="transcript-speaker-actions"><button type="button" disabled={speakerSaving} onClick={() => { setEditingSpeakers(false); setSpeakerNames(Object.fromEntries(speakers.map(speaker => [speaker, speaker]))) }}>Cancel</button><button type="button" className="primary" disabled={speakerSaving || speakers.some(speaker => !(speakerNames[speaker] || '').trim())} onClick={saveSpeakerNames}>{speakerSaving ? 'Saving…' : 'Save names'}</button></div></> : <button type="button" onClick={() => setEditingSpeakers(true)}>Edit speaker names</button>}</section>}
       {segments.length ? <div className="transcript-segments">{segments.map((segment, index) => {
         const active = playbackTime >= Number(segment.start) && playbackTime < Number(segment.end)
-        return <button type="button" className={`${segment.speaker ? 'has-speaker ' : ''}${active ? 'active' : ''}`} key={`${segment.start}-${index}`} onClick={() => seekToSegment(segment)} aria-label={`Play transcript from ${formatTranscriptTimestamp(segment.start)}`}><time>{formatTranscriptTimestamp(segment.start)} – {formatTranscriptTimestamp(segment.end)}</time>{segment.speaker && <strong>{segment.speaker}</strong>}<p>{segment.text}</p></button>
+        const startLabel = usesRecordedClock ? formatPlaybackTimestamp(transcript.recording.startTime, segment.start) : formatTranscriptTimestamp(segment.start)
+        const endLabel = usesRecordedClock ? formatPlaybackTimestamp(transcript.recording.startTime, segment.end) : formatTranscriptTimestamp(segment.end)
+        return <button type="button" className={`${segment.speaker ? 'has-speaker ' : ''}${active ? 'active' : ''}`} key={`${segment.start}-${index}`} onClick={() => seekToSegment(segment)} aria-label={`Play transcript from ${startLabel}`}><time>{startLabel} – {endLabel}</time>{segment.speaker && <strong>{segment.speaker}</strong>}<p>{segment.text}</p></button>
       })}</div> : <pre>{transcript.text || 'No speech was detected in this recording.'}</pre>}
       {hasSpeakerLabels && <p className="transcript-click-hint">Click a line to play from that point. The active line follows playback.</p>}
     </div>}
@@ -1851,7 +1826,6 @@ export default function App() {
   const [rotatingVideoIds, setRotatingVideoIds] = useState(() => new Set())
   const [bulkRotation, setBulkRotation] = useState(90)
   const [bulkBusy, setBulkBusy] = useState(false)
-  const [sourceSavingIds, setSourceSavingIds] = useState(() => new Set())
   const [videoExport, setVideoExport] = useState(null)
   const [audioExport, setAudioExport] = useState(null)
   const [storageSettingsOpen, setStorageSettingsOpen] = useState(false)
@@ -2289,32 +2263,6 @@ export default function App() {
       if (result.notFoundIds?.length) setError(`${result.notFoundIds.length} selected item(s) no longer exist.`)
     } catch (err) { setError(err.message) }
     finally { setNoteSaving(false) }
-  }
-
-  const updateRecordingSource = async (type, recording, source) => {
-    const key = `${type}:${recording.id}`
-    setSourceSavingIds(current => new Set(current).add(key))
-    try {
-      const updated = await api(`/api/${type}/${recording.id}/source`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(source),
-      })
-      if (type === 'videos') {
-        setVideos(items => items.map(item => item.id === updated.id ? updated : item))
-        if (selected?.id === updated.id) setSelected(updated)
-      } else {
-        setAudio(items => items.map(item => item.id === updated.id ? updated : item))
-        if (selectedAudio?.id === updated.id) setSelectedAudio(updated)
-      }
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setSourceSavingIds(current => {
-        const next = new Set(current)
-        next.delete(key)
-        return next
-      })
-    }
   }
 
   const remove = async (video) => {
@@ -2858,7 +2806,7 @@ export default function App() {
               <td className="select-cell"><input type="checkbox" checked={selectedVideoIds.has(video.id)} onChange={() => toggleSelection(setSelectedVideoIds, video.id)} aria-label={`Select ${video.originalFilename || video.filename}`} /></td>
               <td>{formatDate(video.startTime)}</td>
               <td className="file"><span>{video.originalFilename || video.filename}</span><small>#{video.id}</small></td>
-              <td><SourceSelect recording={video} devices={devices} disabled={sourceSavingIds.has(`videos:${video.id}`)} onChange={source => updateRecordingSource('videos', video, source)} /></td>
+              <td><span className="source-label">{sourceLabel(video)}</span></td>
               <td><button className={`note-preview ${video.note ? 'has-note' : ''}`} onClick={() => openNoteEditor('video', video)} title={video.note || 'Add note'}>{video.note || 'Add note'}</button></td>
               <td>{formatDuration(video.durationSeconds)}</td><td>{formatBytes(video.fileSizeBytes)}</td>
               <td>{video.playbackRotationDegrees || 0} deg</td>
@@ -2900,7 +2848,7 @@ export default function App() {
               <td className="select-cell"><input type="checkbox" checked={selectedAudioIds.has(recording.id)} onChange={() => toggleSelection(setSelectedAudioIds, recording.id)} aria-label={`Select ${recording.originalFilename || recording.filename}`} /></td>
               <td>{formatDate(recording.startTime)}</td>
               <td className="file"><span>{recording.originalFilename || recording.filename}</span><small>#{recording.id}</small></td>
-              <td><SourceSelect recording={recording} devices={devices} disabled={sourceSavingIds.has(`audio:${recording.id}`)} onChange={source => updateRecordingSource('audio', recording, source)} /></td>
+              <td><span className="source-label">{sourceLabel(recording)}</span></td>
               <td><button className={`note-preview ${recording.note ? 'has-note' : ''}`} onClick={() => openNoteEditor('audio', recording)} title={recording.note || 'Add note'}>{recording.note || 'Add note'}</button></td>
               <td>{formatDuration(recording.durationSeconds)}</td><td>{formatBytes(recording.fileSizeBytes)}</td>
               <td><div className="recording-status"><span className={`pill ${recording.locked ? 'locked' : ''}`}>{recording.locked ? 'Locked' : 'Unlocked'}</span>
