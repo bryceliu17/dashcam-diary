@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain Dual Android Clients"
+  short_description: "Safely maintain current and Android 5 clients"
+  default_prompt: "Use $maintain-dual-android-clients to apply Android behavior safely across android-app and android-app-legacy."

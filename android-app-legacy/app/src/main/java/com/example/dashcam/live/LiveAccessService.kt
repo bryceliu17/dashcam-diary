@@ -1,0 +1,988 @@
+package com.example.dashcam.live
+
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Rect
+import android.graphics.SurfaceTexture
+import android.graphics.YuvImage
+import android.graphics.ImageFormat
+import android.hardware.Camera
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
+import android.media.ImageReader
+import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
+import android.view.Surface
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.example.dashcam.MainActivity
+import com.example.dashcam.R
+import com.example.dashcam.battery.BatteryHistoryPayload
+import com.example.dashcam.network.DeviceStatusReporter
+import com.example.dashcam.network.ServerClient
+import com.example.dashcam.network.toJson
+import com.example.dashcam.recording.PowerRecordingSettings
+import com.example.dashcam.recording.RemoteRecordingControl
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import com.example.dashcam.upload.UploadWorker
+import com.example.dashcam.upload.UploadPolicySettings
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+class LiveAccessService : Service() {
+    private val recordingCommandMutex = Mutex()
+    private fun connectionEnabled() = LiveAccessSettings.isEnabled(this) || RemoteRecordingControl.isEnabled(this)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val frameUploading = AtomicBoolean(false)
+    private val cameraGeneration = AtomicInteger(0)
+    private lateinit var cameraThread: HandlerThread
+    private lateinit var cameraHandler: Handler
+    private var monitorJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var imageReader: ImageReader? = null
+    private var legacyCamera: Camera? = null
+    private var legacySurfaceTexture: SurfaceTexture? = null
+    private var camera2SurfaceTexture: SurfaceTexture? = null
+    private var camera2Surface: Surface? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var liveClientUrl = ""
+    private var liveClient: ServerClient? = null
+    private val socketClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .pingInterval(60, TimeUnit.SECONDS)
+        .build()
+    private val socketStateLock = Any()
+    private var socketGeneration = 0
+    private var socketConnecting = false
+    @Volatile private var controlSocket: WebSocket? = null
+    private var reconnectAttempt = 0
+    @Volatile private var liveRequested = false
+    @Volatile private var cameraStarting = false
+    @Volatile private var streaming = false
+    @Volatile private var torchEnabled = false
+    @Volatile private var activeCameraHasFlash = false
+    @Volatile private var requestedCameraFacing = CAMERA_FACING_BACK
+    private var lastLegacyFrameAt = 0L
+    @Volatile private var cameraStartRunnable: Runnable? = null
+
+    private val captureRunnable = object : Runnable {
+        override fun run() {
+            if (!streaming) return
+            val session = captureSession
+            val reader = imageReader
+            val device = cameraDevice
+            if (session == null || reader == null || device == null) {
+                stopStreaming("Live camera became unavailable")
+                return
+            }
+            try {
+                val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(reader.surface)
+                    set(CaptureRequest.JPEG_QUALITY, 65.toByte())
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    set(
+                        CaptureRequest.FLASH_MODE,
+                        if (torchEnabled && activeCameraHasFlash) CaptureRequest.FLASH_MODE_TORCH
+                        else CaptureRequest.FLASH_MODE_OFF
+                    )
+                }.build()
+                session.capture(request, null, cameraHandler)
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to capture live frame", error)
+            } finally {
+                if (streaming) cameraHandler.postDelayed(this, FRAME_INTERVAL_MS)
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        cameraThread = HandlerThread("dashcam-live-camera").apply { start() }
+        cameraHandler = Handler(cameraThread.looper)
+        LiveAccessSettings.setStreaming(this, false)
+        LiveAccessSettings.setError(this, null)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_DISABLE -> {
+                LiveAccessSettings.setEnabled(this, false)
+                liveRequested = false
+                stopStreaming()
+                if (RemoteRecordingControl.isEnabled(this)) {
+                    updateNotification()
+                    broadcastState()
+                    scope.launch { DeviceStatusReporter.reportNow(this@LiveAccessService) }
+                    return START_STICKY
+                }
+                stopMonitoring()
+                broadcastState()
+                scope.launch { DeviceStatusReporter.reportNow(this@LiveAccessService) }
+                stopForegroundCompat()
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            else -> {
+                if (intent?.action == ACTION_ENABLE) LiveAccessSettings.setEnabled(this, true)
+                if (!connectionEnabled()) {
+                    startForeground(NOTIFICATION_ID, buildNotification())
+                    stopMonitoring()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                startForeground(NOTIFICATION_ID, buildNotification())
+                startMonitoring()
+                broadcastState()
+                return START_STICKY
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startMonitoring() {
+        if (monitorJob?.isActive == true) return
+        monitorJob = scope.launch {
+            DeviceStatusReporter.reportNow(this@LiveAccessService)?.let {
+                applyLiveRequest(it.liveRequested)
+            }
+            connectControlSocket()
+            while (isActive && connectionEnabled()) {
+                val recording = PowerRecordingSettings.isAnyRecordingActive(this@LiveAccessService)
+                if (recording && (liveRequested || streaming || cameraStarting)) {
+                    liveRequested = false
+                    stopStreaming("Live stopped because recording started")
+                    DeviceStatusReporter.reportNow(this@LiveAccessService)
+                }
+                delay(SAFETY_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun connectControlSocket() {
+        if (!connectionEnabled()) return
+        val generation = synchronized(socketStateLock) {
+            if (controlSocket != null || socketConnecting) return
+            socketConnecting = true
+            socketGeneration += 1
+            socketGeneration
+        }
+        val serverUrl = getSharedPreferences(UploadWorker.PREFS, Context.MODE_PRIVATE)
+            .getString(UploadWorker.KEY_SERVER_URL, UploadWorker.DEFAULT_SERVER_URL)
+            ?: UploadWorker.DEFAULT_SERVER_URL
+        val socketBase = when {
+            serverUrl.startsWith("https://", ignoreCase = true) -> "wss://${serverUrl.substring(8)}"
+            serverUrl.startsWith("http://", ignoreCase = true) -> "ws://${serverUrl.substring(7)}"
+            else -> serverUrl
+        }.trimEnd('/')
+        val request = Request.Builder()
+            .url("$socketBase/api/devices/socket?deviceId=${Uri.encode(DeviceStatusReporter.deviceId(this))}")
+            .build()
+        socketClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                synchronized(socketStateLock) {
+                    if (generation != socketGeneration || !connectionEnabled()) {
+                        webSocket.close(1000, "Live Access disabled")
+                        return
+                    }
+                    socketConnecting = false
+                    controlSocket = webSocket
+                    reconnectAttempt = 0
+                }
+                reconnectJob?.cancel()
+                DeviceStatusReporter.setWebSocketStatusSender { status ->
+                    webSocket.send(
+                        JSONObject()
+                            .put("type", "device_status")
+                            .put("status", status.toJson())
+                            .toString()
+                    )
+                }
+                scope.launch {
+                    DeviceStatusReporter.reportNow(this@LiveAccessService)
+                }
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                if (generation != socketGeneration) return
+                val message = try { JSONObject(text) } catch (_: Exception) { return }
+                if (message.optString("type") == "recording_request") {
+                    scope.launch {
+                        // Serialize commands; recheck permission and expiry at execution time.
+                        recordingCommandMutex.withLock {
+                            val response = RemoteRecordingControl.execute(this@LiveAccessService, message)
+                            DeviceStatusReporter.reportNow(this@LiveAccessService)
+                            webSocket.send(response)
+                            withContext(Dispatchers.Main) { broadcastState() }
+                        }
+                    }
+                    return
+                }
+                handleControlMessage(message)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                handleSocketDisconnected(generation, webSocket)
+            }
+
+            override fun onFailure(webSocket: WebSocket, error: Throwable, response: Response?) {
+                Log.d(TAG, "Live control WebSocket disconnected: ${error.message.orEmpty()}")
+                handleSocketDisconnected(generation, webSocket)
+            }
+        })
+    }
+
+    private fun handleSocketDisconnected(generation: Int, webSocket: WebSocket) {
+        synchronized(socketStateLock) {
+            if (generation != socketGeneration) return
+            if (controlSocket === webSocket) controlSocket = null
+            socketConnecting = false
+        }
+        DeviceStatusReporter.setWebSocketStatusSender(null)
+        scope.launch {
+            liveRequested = false
+            stopStreaming("Live control connection lost")
+            DeviceStatusReporter.reportNow(this@LiveAccessService)
+            scheduleReconnect()
+        }
+    }
+
+    private fun scheduleReconnect() {
+        if (!connectionEnabled() || reconnectJob?.isActive == true) return
+        val delayMs = RECONNECT_DELAYS_MS[reconnectAttempt.coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
+        reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            connectControlSocket()
+        }
+    }
+
+    private fun stopMonitoring() {
+        monitorJob?.cancel()
+        monitorJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
+        val socket = synchronized(socketStateLock) {
+            socketGeneration += 1
+            socketConnecting = false
+            controlSocket.also { controlSocket = null }
+        }
+        DeviceStatusReporter.setWebSocketStatusSender(null)
+        socket?.close(1000, "Live Access disabled")
+    }
+
+    private fun applyLiveRequest(enabled: Boolean) {
+        if (enabled && !LiveAccessSettings.isEnabled(this)) return
+        if (enabled && !liveRequested) requestedCameraFacing = CAMERA_FACING_BACK
+        if (!enabled) requestedCameraFacing = CAMERA_FACING_BACK
+        liveRequested = enabled
+        val recording = PowerRecordingSettings.isAnyRecordingActive(this)
+        when {
+            enabled && recording -> {
+                liveRequested = false
+                stopStreaming("Phone is recording")
+            }
+            !enabled -> stopStreaming()
+            enabled && !streaming && !cameraStarting -> startStreaming()
+            enabled -> setError(null)
+        }
+        scope.launch { DeviceStatusReporter.reportNow(this@LiveAccessService) }
+    }
+
+    private fun handleControlMessage(message: JSONObject) {
+        when (message.optString("type")) {
+            "live_request" -> applyLiveRequest(message.optBoolean("enabled", false))
+            "upload_policy" -> UploadPolicySettings.update(
+                this,
+                message.optBoolean("allowed", true)
+            )
+            "torch_request" -> applyTorchRequest(
+                message.optString("requestId"),
+                message.optBoolean("enabled", false)
+            )
+            "live_camera_request" -> applyLiveCameraRequest(
+                message.optString("requestId"),
+                message.optString("facing")
+            )
+            "battery_history_request" -> {
+                val requestId = message.optString("requestId")
+                if (requestId.isNotBlank()) scope.launch {
+                    val response = BatteryHistoryPayload.create(
+                        this@LiveAccessService,
+                        requestId,
+                        message.optInt("hours", 24)
+                    )
+                    controlSocket?.send(response.toString())
+                }
+            }
+        }
+    }
+
+    private fun startStreaming() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            setError("Camera permission is required")
+            return
+        }
+        cameraStarting = true
+        streaming = true
+        torchEnabled = false
+        activeCameraHasFlash = false
+        LiveAccessSettings.setStreaming(this, true)
+        setError(null)
+        broadcastState()
+        val generation = cameraGeneration.incrementAndGet()
+        val startRunnable = Runnable cameraStart@{
+            if (!isCurrentCameraRequest(generation)) return@cameraStart
+            try {
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    startLegacyStreaming(generation)
+                    return@cameraStart
+                }
+                val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val targetLensFacing = if (requestedCameraFacing == CAMERA_FACING_FRONT) {
+                    CameraCharacteristics.LENS_FACING_FRONT
+                } else {
+                    CameraCharacteristics.LENS_FACING_BACK
+                }
+                val cameraId = manager.cameraIdList.firstOrNull { id ->
+                    manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
+                        targetLensFacing
+                }
+                if (cameraId == null) {
+                    stopStreaming(cameraUnavailableMessage(requestedCameraFacing))
+                    return@cameraStart
+                }
+                val characteristics = manager.getCameraCharacteristics(cameraId)
+                activeCameraHasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                val sizes = characteristics
+                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?.getOutputSizes(ImageFormat.JPEG)
+                    .orEmpty()
+                val size = sizes
+                    .filter { it.width <= 1280 && it.height <= 720 }
+                    .maxByOrNull { it.width * it.height }
+                    ?: sizes.minByOrNull { it.width * it.height }
+                if (size == null) {
+                    stopStreaming("Camera does not support JPEG live frames")
+                    return@cameraStart
+                }
+                imageReader = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2).apply {
+                    setOnImageAvailableListener({ reader -> handleImage(reader) }, cameraHandler)
+                }
+                val texture = SurfaceTexture(0).apply { setDefaultBufferSize(size.width, size.height) }
+                camera2SurfaceTexture = texture
+                camera2Surface = Surface(texture)
+                manager.openCamera(cameraId, cameraStateCallback(generation), cameraHandler)
+            } catch (error: Exception) {
+                if (generation == cameraGeneration.get()) {
+                    stopStreaming("Unable to open live camera: ${error.message.orEmpty()}")
+                }
+            }
+        }
+        cameraStartRunnable = startRunnable
+        cameraHandler.postDelayed(startRunnable, cameraReleaseDelayMs())
+    }
+
+    private fun isCurrentCameraRequest(generation: Int): Boolean =
+        generation == cameraGeneration.get() && liveRequested && streaming && cameraStarting
+
+    @Suppress("DEPRECATION")
+    private fun startLegacyStreaming(generation: Int) {
+        val cameraId = findLegacyCameraId(requestedCameraFacing)
+            ?: return stopStreaming(cameraUnavailableMessage(requestedCameraFacing))
+        val camera = Camera.open(cameraId)
+        if (!isCurrentCameraRequest(generation)) {
+            camera.release()
+            return
+        }
+        legacyCamera = camera
+        val parameters = camera.parameters
+        activeCameraHasFlash = parameters.supportedFlashModes?.contains(Camera.Parameters.FLASH_MODE_TORCH) == true
+        val size = parameters.supportedPreviewSizes
+            .filter { it.width <= 1280 && it.height <= 720 }
+            .maxByOrNull { it.width * it.height }
+            ?: parameters.supportedPreviewSizes.minByOrNull { it.width * it.height }
+            ?: throw IllegalStateException("Camera does not support preview frames")
+        parameters.setPreviewSize(size.width, size.height)
+        parameters.previewFormat = ImageFormat.NV21
+        if (parameters.supportedFocusModes?.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO) == true) {
+            parameters.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
+        }
+        parameters.supportedPreviewFpsRange
+            ?.maxByOrNull { it[1] }
+            ?.let { parameters.setPreviewFpsRange(it[0], it[1]) }
+        camera.parameters = parameters
+
+        val texture = SurfaceTexture(0).apply {
+            setDefaultBufferSize(size.width, size.height)
+        }
+        legacySurfaceTexture = texture
+        camera.setPreviewTexture(texture)
+        val bufferSize = size.width * size.height * ImageFormat.getBitsPerPixel(ImageFormat.NV21) / 8
+        repeat(2) { camera.addCallbackBuffer(ByteArray(bufferSize)) }
+        camera.setPreviewCallbackWithBuffer { data, source ->
+            if (generation != cameraGeneration.get() || !liveRequested || !streaming) {
+                return@setPreviewCallbackWithBuffer
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastLegacyFrameAt < FRAME_INTERVAL_MS ||
+                !frameUploading.compareAndSet(false, true)
+            ) {
+                source.addCallbackBuffer(data)
+                return@setPreviewCallbackWithBuffer
+            }
+            lastLegacyFrameAt = now
+            val frame = data.copyOf()
+            source.addCallbackBuffer(data)
+            scope.launch {
+                try {
+                    val output = ByteArrayOutputStream()
+                    val encoded = YuvImage(
+                        frame,
+                        ImageFormat.NV21,
+                        size.width,
+                        size.height,
+                        null
+                    ).compressToJpeg(
+                        Rect(0, 0, size.width, size.height),
+                        LEGACY_JPEG_QUALITY,
+                        output
+                    )
+                    if (encoded && streaming) {
+                        currentClient().uploadLiveFrame(
+                            DeviceStatusReporter.deviceId(this@LiveAccessService),
+                            output.toByteArray()
+                        )
+                    }
+                } catch (error: Exception) {
+                    Log.d(TAG, "Legacy live frame upload deferred: ${error.message.orEmpty()}")
+                } finally {
+                    frameUploading.set(false)
+                }
+            }
+        }
+        if (!isCurrentCameraRequest(generation)) {
+            camera.setPreviewCallbackWithBuffer(null)
+            legacyCamera = null
+            legacySurfaceTexture = null
+            texture.release()
+            camera.release()
+            return
+        }
+        camera.startPreview()
+        if (!isCurrentCameraRequest(generation)) {
+            camera.setPreviewCallbackWithBuffer(null)
+            try { camera.stopPreview() } catch (_: Exception) { }
+            legacyCamera = null
+            legacySurfaceTexture = null
+            texture.release()
+            camera.release()
+            return
+        }
+        cameraStarting = false
+        streaming = true
+        LiveAccessSettings.setStreaming(this, true)
+        LiveAccessSettings.setError(this, null)
+        acquireStreamingLocks()
+        updateNotification()
+        broadcastState()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun findLegacyCameraId(facing: String): Int? {
+        val targetFacing = if (facing == CAMERA_FACING_FRONT) {
+            Camera.CameraInfo.CAMERA_FACING_FRONT
+        } else {
+            Camera.CameraInfo.CAMERA_FACING_BACK
+        }
+        val info = Camera.CameraInfo()
+        for (id in 0 until Camera.getNumberOfCameras()) {
+            Camera.getCameraInfo(id, info)
+            if (info.facing == targetFacing) return id
+        }
+        return null
+    }
+
+    private fun cameraStateCallback(generation: Int) = object : CameraDevice.StateCallback() {
+        override fun onOpened(camera: CameraDevice) {
+            if (!isCurrentCameraRequest(generation)) {
+                camera.close()
+                return
+            }
+            cameraDevice = camera
+            val surface = imageReader?.surface ?: return stopStreaming("Live frame surface unavailable")
+            val repeatingSurface = camera2Surface ?: return stopStreaming("Live preview surface unavailable")
+            try {
+                camera.createCaptureSession(
+                    listOf(surface, repeatingSurface),
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            if (!isCurrentCameraRequest(generation)) {
+                                session.close()
+                                camera.close()
+                                if (cameraDevice === camera) cameraDevice = null
+                                return
+                            }
+                            captureSession = session
+                            try {
+                                updateCamera2RepeatingRequest()
+                            } catch (error: Exception) {
+                                session.close()
+                                stopStreaming("Unable to start live preview: ${error.message.orEmpty()}")
+                                return
+                            }
+                            cameraStarting = false
+                            streaming = true
+                            LiveAccessSettings.setStreaming(this@LiveAccessService, true)
+                            LiveAccessSettings.setError(this@LiveAccessService, null)
+                            acquireStreamingLocks()
+                            updateNotification()
+                            broadcastState()
+                            cameraHandler.post(captureRunnable)
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            session.close()
+                            if (generation == cameraGeneration.get()) {
+                                stopStreaming("Unable to configure live camera")
+                            }
+                        }
+                    },
+                    cameraHandler
+                )
+            } catch (error: Exception) {
+                camera.close()
+                if (cameraDevice === camera) cameraDevice = null
+                if (generation == cameraGeneration.get()) {
+                    stopStreaming("Unable to start live camera: ${error.message.orEmpty()}")
+                }
+            }
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            camera.close()
+            if (generation == cameraGeneration.get()) {
+                stopStreaming("Live camera disconnected")
+            }
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            camera.close()
+            if (generation == cameraGeneration.get()) {
+                stopStreaming("Live camera error $error")
+            }
+        }
+    }
+
+    private fun applyTorchRequest(requestId: String, enabled: Boolean, attemptsRemaining: Int = 24) {
+        if (requestId.isBlank()) return
+        cameraHandler.post {
+            val ready = !cameraStarting && (legacyCamera != null || (captureSession != null && cameraDevice != null))
+            if (!streaming || !ready) {
+                if (liveRequested && cameraStarting && attemptsRemaining > 0) {
+                    cameraHandler.postDelayed(
+                        { applyTorchRequest(requestId, enabled, attemptsRemaining - 1) },
+                        TORCH_READY_RETRY_MS
+                    )
+                    return@post
+                }
+                sendTorchResponse(requestId, false, false, "Live camera is not ready")
+                return@post
+            }
+            if (!activeCameraHasFlash) {
+                torchEnabled = false
+                sendTorchResponse(requestId, false, false, "This camera has no controllable flashlight")
+                return@post
+            }
+            val previous = torchEnabled
+            torchEnabled = enabled
+            try {
+                if (legacyCamera != null) updateLegacyTorch() else updateCamera2RepeatingRequest()
+                sendTorchResponse(requestId, true, torchEnabled, null)
+            } catch (error: Exception) {
+                torchEnabled = previous
+                try {
+                    if (legacyCamera != null) updateLegacyTorch() else updateCamera2RepeatingRequest()
+                } catch (_: Exception) {
+                }
+                sendTorchResponse(requestId, true, previous, error.message ?: "Unable to control flashlight")
+            }
+        }
+    }
+
+    private fun applyLiveCameraRequest(requestId: String, facing: String) {
+        if (requestId.isBlank()) return
+        val normalizedFacing = facing.lowercase()
+        if (normalizedFacing != CAMERA_FACING_BACK && normalizedFacing != CAMERA_FACING_FRONT) {
+            sendLiveCameraResponse(requestId, normalizedFacing, "Unknown camera selection")
+            return
+        }
+        cameraHandler.post {
+            if (!liveRequested) {
+                sendLiveCameraResponse(requestId, normalizedFacing, "Live camera is not active")
+                return@post
+            }
+            if (!hasCameraFacing(normalizedFacing)) {
+                sendLiveCameraResponse(requestId, normalizedFacing, cameraUnavailableMessage(normalizedFacing))
+                return@post
+            }
+            if (requestedCameraFacing == normalizedFacing && (streaming || cameraStarting)) {
+                sendLiveCameraResponse(requestId, normalizedFacing, null)
+                return@post
+            }
+            requestedCameraFacing = normalizedFacing
+            torchEnabled = false
+            val mustRestart = streaming || cameraStarting
+            if (mustRestart) stopStreaming()
+            cameraHandler.postDelayed({
+                if (!liveRequested) {
+                    sendLiveCameraResponse(requestId, normalizedFacing, "Live camera was closed")
+                    return@postDelayed
+                }
+                startStreaming()
+                sendLiveCameraResponse(requestId, normalizedFacing, null)
+            }, if (mustRestart) cameraReleaseDelayMs() else 0L)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hasCameraFacing(facing: String): Boolean = try {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            findLegacyCameraId(facing) != null
+        } else {
+            val targetLensFacing = if (facing == CAMERA_FACING_FRONT) {
+                CameraCharacteristics.LENS_FACING_FRONT
+            } else {
+                CameraCharacteristics.LENS_FACING_BACK
+            }
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            manager.cameraIdList.any { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == targetLensFacing
+            }
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun cameraUnavailableMessage(facing: String): String =
+        if (facing == CAMERA_FACING_FRONT) "Front camera is unavailable" else "Back camera is unavailable"
+
+    @Suppress("DEPRECATION")
+    private fun updateLegacyTorch() {
+        val camera = legacyCamera ?: throw IllegalStateException("Live camera is not ready")
+        val parameters = camera.parameters
+        val mode = if (torchEnabled) Camera.Parameters.FLASH_MODE_TORCH else Camera.Parameters.FLASH_MODE_OFF
+        if (parameters.supportedFlashModes?.contains(mode) != true) {
+            throw IllegalStateException("This camera cannot use the requested flashlight mode")
+        }
+        parameters.flashMode = mode
+        camera.parameters = parameters
+    }
+
+    private fun updateCamera2RepeatingRequest() {
+        val device = cameraDevice ?: throw IllegalStateException("Live camera is not ready")
+        val session = captureSession ?: throw IllegalStateException("Live camera session is not ready")
+        val surface = camera2Surface ?: throw IllegalStateException("Live preview surface is unavailable")
+        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(surface)
+            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            set(
+                CaptureRequest.FLASH_MODE,
+                if (torchEnabled && activeCameraHasFlash) CaptureRequest.FLASH_MODE_TORCH
+                else CaptureRequest.FLASH_MODE_OFF
+            )
+        }.build()
+        session.setRepeatingRequest(request, null, cameraHandler)
+    }
+
+    private fun sendTorchResponse(requestId: String, available: Boolean, enabled: Boolean, error: String?) {
+        controlSocket?.send(
+            JSONObject()
+                .put("type", "torch_response")
+                .put("requestId", requestId)
+                .put("available", available)
+                .put("enabled", enabled)
+                .put("error", error ?: JSONObject.NULL)
+                .toString()
+        )
+    }
+
+    private fun sendLiveCameraResponse(requestId: String, facing: String, error: String?) {
+        controlSocket?.send(
+            JSONObject()
+                .put("type", "live_camera_response")
+                .put("requestId", requestId)
+                .put("facing", facing)
+                .put("error", error ?: JSONObject.NULL)
+                .toString()
+        )
+    }
+
+    private fun handleImage(reader: ImageReader) {
+        val image = reader.acquireLatestImage() ?: return
+        val bytes = try {
+            val buffer = image.planes[0].buffer
+            ByteArray(buffer.remaining()).also(buffer::get)
+        } finally {
+            image.close()
+        }
+        if (!streaming || !frameUploading.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                currentClient().uploadLiveFrame(DeviceStatusReporter.deviceId(this@LiveAccessService), bytes)
+            } catch (error: Exception) {
+                Log.d(TAG, "Live frame upload deferred: ${error.message.orEmpty()}")
+            } finally {
+                frameUploading.set(false)
+            }
+        }
+    }
+
+    private fun stopStreaming(error: String? = null) {
+        cameraGeneration.incrementAndGet()
+        cameraStarting = false
+        streaming = false
+        torchEnabled = false
+        LiveAccessSettings.setStreaming(this, false)
+        LiveAccessSettings.setError(this, error)
+        if (::cameraHandler.isInitialized) {
+            cameraStartRunnable?.let(cameraHandler::removeCallbacks)
+            cameraStartRunnable = null
+            cameraHandler.removeCallbacks(captureRunnable)
+            cameraHandler.post {
+                try {
+                    if (legacyCamera != null && activeCameraHasFlash) updateLegacyTorch()
+                    legacyCamera?.setPreviewCallbackWithBuffer(null)
+                    legacyCamera?.stopPreview()
+                } catch (_: Exception) {
+                }
+                legacyCamera?.release()
+                legacyCamera = null
+                legacySurfaceTexture?.release()
+                legacySurfaceTexture = null
+                try {
+                    if (captureSession != null && cameraDevice != null) updateCamera2RepeatingRequest()
+                    captureSession?.stopRepeating()
+                } catch (_: Exception) {
+                }
+                captureSession?.close()
+                captureSession = null
+                cameraDevice?.close()
+                cameraDevice = null
+                imageReader?.close()
+                imageReader = null
+                camera2Surface?.release()
+                camera2Surface = null
+                camera2SurfaceTexture?.release()
+                camera2SurfaceTexture = null
+                activeCameraHasFlash = false
+            }
+        }
+        releaseStreamingLocks()
+        updateNotification()
+        broadcastState()
+    }
+
+    private fun setError(message: String?) {
+        LiveAccessSettings.setError(this, message)
+        updateNotification()
+        broadcastState()
+    }
+
+    private fun currentClient(): ServerClient {
+        val serverUrl = getSharedPreferences(UploadWorker.PREFS, Context.MODE_PRIVATE)
+            .getString(UploadWorker.KEY_SERVER_URL, UploadWorker.DEFAULT_SERVER_URL)
+            ?: UploadWorker.DEFAULT_SERVER_URL
+        val existing = liveClient
+        if (existing != null && liveClientUrl == serverUrl) return existing
+        return ServerClient(serverUrl).also {
+            liveClientUrl = serverUrl
+            liveClient = it
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireStreamingLocks() {
+        if (wakeLock?.isHeld != true) {
+            wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:stream").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        }
+        if (wifiLock?.isHeld != true) {
+            wifiLock = (getSystemService(Context.WIFI_SERVICE) as WifiManager)
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$TAG:stream").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        }
+    }
+
+    private fun releaseStreamingLocks() {
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        if (wifiLock?.isHeld == true) wifiLock?.release()
+        wakeLock = null
+        wifiLock = null
+    }
+
+    private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setSmallIcon(R.drawable.ic_dashcam)
+        .setContentTitle("Dashcam Diary server connection")
+        .setContentText(
+            when {
+                streaming -> "Live camera streaming"
+                LiveAccessSettings.error(this).isNotBlank() -> LiveAccessSettings.error(this)
+                else -> "Waiting for a server request"
+            }
+        )
+        .setOngoing(true)
+        .setContentIntent(
+            PendingIntent.getActivity(
+                this, 0, Intent(this, MainActivity::class.java),
+                pendingIntentFlags()
+            )
+        )
+        .addAction(
+            0,
+            "Disable Live Access",
+            PendingIntent.getService(
+                this, 1, Intent(this, LiveAccessService::class.java).setAction(ACTION_DISABLE),
+                pendingIntentFlags()
+            )
+        )
+        .build()
+
+    private fun updateNotification() {
+        if (!connectionEnabled()) return
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "Dashcam Diary live access", NotificationManager.IMPORTANCE_LOW)
+                )
+        }
+    }
+
+    private fun pendingIntentFlags(): Int =
+        PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+
+    @Suppress("DEPRECATION")
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            stopForeground(true)
+        }
+    }
+
+    private fun cameraReleaseDelayMs(): Long =
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) 900L else CAMERA_RELEASE_DELAY_MS
+
+    private fun broadcastState() {
+        sendBroadcast(
+            Intent(ACTION_STATE)
+                .setPackage(packageName)
+                .putExtra(EXTRA_ENABLED, LiveAccessSettings.isEnabled(this))
+                .putExtra(EXTRA_STREAMING, LiveAccessSettings.isStreaming(this))
+                .putExtra(EXTRA_ERROR, LiveAccessSettings.error(this))
+        )
+    }
+
+    override fun onDestroy() {
+        liveRequested = false
+        stopMonitoring()
+        stopStreaming()
+        socketClient.dispatcher.cancelAll()
+        socketClient.connectionPool.evictAll()
+        if (::cameraThread.isInitialized) cameraThread.quitSafely()
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    companion object {
+        const val ACTION_ENABLE = "com.example.dashcam.live.ENABLE"
+        const val ACTION_REFRESH = "com.example.dashcam.live.REFRESH"
+        const val ACTION_DISABLE = "com.example.dashcam.live.DISABLE"
+        const val ACTION_STATE = "com.example.dashcam.live.STATE"
+        const val EXTRA_ENABLED = "enabled"
+        const val EXTRA_STREAMING = "streaming"
+        const val EXTRA_ERROR = "error"
+        private const val CHANNEL_ID = "dashcam_live_access"
+        private const val NOTIFICATION_ID = 2004
+        private const val SAFETY_INTERVAL_MS = 15_000L
+        private const val FRAME_INTERVAL_MS = 125L
+        private const val TORCH_READY_RETRY_MS = 250L
+        private const val LEGACY_JPEG_QUALITY = 60
+        private const val CAMERA_RELEASE_DELAY_MS = 300L
+        private const val CAMERA_FACING_BACK = "back"
+        private const val CAMERA_FACING_FRONT = "front"
+        private const val TAG = "LiveAccessService"
+        private val RECONNECT_DELAYS_MS = longArrayOf(5_000L, 15_000L, 30_000L, 60_000L)
+
+        fun enable(context: Context) {
+            ContextCompat.startForegroundService(
+                context.applicationContext,
+                Intent(context.applicationContext, LiveAccessService::class.java).setAction(ACTION_ENABLE)
+            )
+        }
+
+        fun refreshConnection(context: Context) {
+            ContextCompat.startForegroundService(context.applicationContext,
+                Intent(context.applicationContext, LiveAccessService::class.java).setAction(ACTION_REFRESH))
+        }
+
+        fun disable(context: Context) {
+            context.applicationContext.startService(
+                Intent(context.applicationContext, LiveAccessService::class.java).setAction(ACTION_DISABLE)
+            )
+        }
+    }
+
+}

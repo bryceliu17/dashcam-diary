@@ -19,6 +19,10 @@ web-dashboard/dist/
 **/.gradle/
 android-app/local.properties
 android-app/app/build/
+android-app/build/
+android-app-legacy/local.properties
+android-app-legacy/app/build/
+android-app-legacy/build/
 **/.idea/
 *.iml
 

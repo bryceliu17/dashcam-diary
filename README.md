@@ -6,14 +6,15 @@ The phone remains the source of truth until an upload succeeds. A server outage 
 
 ## English
 
-### Maintained branches
+### Maintained components
 
-| Branch | Android support | Default phone video archive | Camera implementation | Responsibility |
+| Path | Android support | Default phone video archive | Camera implementation | Responsibility |
 |---|---:|---:|---|---|
-| `main` | Android 8.0 / API 26+ | 25 GiB | CameraX for foreground preview recording; Camera2 for background recording and Live Access | Maintained Android client, API, dashboard, Docker deployment, and documentation |
-| `android-5-compatible` | Android 5.0 / API 21+ | 5.5 GiB | Legacy `android.hardware.Camera` on Android 5/5.1; Camera2 only on newer systems | Maintained Android 5 client only |
+| `android-app/` | Android 8.0 / API 26+ | 25 GiB | CameraX for foreground preview recording; Camera2 for background recording and Live Access | Current Android client |
+| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | Legacy `android.hardware.Camera` on Android 5/5.1; Camera2 only on newer systems | Android 5-compatible client |
+| `server/`, `web-dashboard/`, `transcription-worker/` | Both clients | Server-configured | Shared API and browser UI | Server, dashboard, and transcription |
 
-The server, web dashboard, Docker files, and deployment documentation in `android-5-compatible` are historical snapshots. Do not update or deploy them; deploy `main`.
+Both Android clients are maintained together on `main`. The old `android-5-compatible` branch is retained only as a historical backup and is no longer a development or deployment source.
 
 ### Architecture
 
@@ -46,7 +47,7 @@ Recording timestamps are saved in UTC. The dashboard displays them in the browse
 - Video segment choices: 1, 3, 5, or 10 minutes, unlimited, or a custom duration. Default: 5 minutes.
 - Audio segment choices: 5, 10, 15, 30, or 60 minutes, unlimited, or a custom duration. Default: 30 minutes.
 - Video and audio are mutually exclusive.
-- On `main`, video and audio have independent, optional GPS modes: **Off**, **Dashcam (3 s / 10 m)**, **Bodycam (5 s / 5 m)**, **Audio diary (60 s / 100 m)**, and **Battery saver (15 s / 25 m)**. GPS is off by default and requires location permission.
+- Both Android clients provide independent video/audio GPS modes: **Off**, **Dashcam (3 s / 10 m)**, **Bodycam (5 s / 5 m)**, **Audio diary (60 s / 100 m)**, and **Battery saver (15 s / 25 m)**. GPS is off by default and requires location permission.
 - Every media segment owns its own GPS track. Local cleanup or deletion removes that segment's points with it; uploaded tracks follow the same media record on the server.
 - Local video/audio lists support status, playback, seeking, rotation where applicable, locking, and deletion.
 - The launcher icon remains available, but the app is excluded from Android's recent-apps screen to reduce accidental swipe-away closures.
@@ -66,7 +67,7 @@ Start alerts are configured independently of the recording mode. The choices are
 
 #### Phone storage and upload
 
-- The default local video limit is **25 GiB** on `main` and **5.5 GiB** on `android-5-compatible`. Local audio defaults to a separate **1.5 GiB** limit.
+- The default local video limit is **25 GiB** in `android-app/` and **5.5 GiB** in `android-app-legacy/`. Local audio defaults to a separate **1.5 GiB** limit.
 - Video and audio limits can be changed on the phone. The suggested combined maximum is the bytes already used by local video/audio plus currently available space minus a 1 GiB reserve.
 - Saving lower limits does not delete existing files immediately; the new limits apply when later recording cleanup runs.
 - Before a new video segment, the app checks the video archive and remaining filesystem space. Low free space uses a 1 GiB trigger.
@@ -83,7 +84,7 @@ Start alerts are configured independently of the recording mode. The choices are
 - The dashboard can request a live camera only while the phone is not recording video or audio.
 - The live viewer supports rotation, fullscreen, and a phone flashlight control when the selected back camera exposes a torch.
 - The flashlight can be turned off manually. It is also turned off when live viewing is closed, the web page becomes hidden, the control connection closes, or the camera is released.
-- On `main`, the live camera and torch use Camera2. On Android 5/5.1, the compatibility client uses the legacy Camera API and its torch setting.
+- In `android-app/`, the live camera and torch use Camera2. On Android 5/5.1, `android-app-legacy/` uses the legacy Camera API and its torch setting.
 - Phones keep local battery-temperature history. The phone UI and dashboard can show the chart and selected readings.
 
 ### Server and dashboard features
@@ -92,7 +93,7 @@ Start alerts are configured independently of the recording mode. The choices are
 - Range-enabled playback, playback rotation, original downloads, timestamp-overlay video downloads, and session downloads/exports.
 - Group nearby recordings into sessions for continuous video or audio playback while retaining individual controls.
 - Video and audio rows show their source device. The source can be changed to another known device, `Unknown`, or blank; session grouping never crosses a source-device boundary.
-- Recordings with GPS data expose a route summary in the dashboard and can download their track as a GPX file. The dashboard does not contact a third-party map provider unless the user opens the supplied OpenStreetMap link.
+- Recordings with GPS data expose an interactive OpenStreetMap route, route summary, and GPX download. Map tiles load only when the user opens a GPS track.
 - Bulk select, lock/unlock, rotate videos, and delete recordings.
 - Audio waveform generation and caching through `ffmpeg`.
 - One-click transcription for audio recordings up to 30 minutes, with language detection, timestamped `Speaker 1` / `Speaker 2` separation, transcript viewing, TXT download, and transcript deletion without deleting the audio. Docker runs `faster-whisper` plus optional local `pyannote.audio` speaker diarization, configured for CUDA by default.
@@ -193,7 +194,7 @@ Open `http://localhost:5173`. Vite proxies `/api` to `http://localhost:5000`. Bu
 
 Requirements: JDK 17, Android SDK 36, and USB debugging when installing with ADB.
 
-Build `main`:
+Build the current Android client:
 
 ```powershell
 cd android-app
@@ -218,12 +219,11 @@ Always use `-s PHONE_SERIAL` when more than one phone is connected.
 Build the Android 5 client:
 
 ```powershell
-git switch android-5-compatible
-cd android-app
+cd android-app-legacy
 .\gradlew.bat assembleDebug
 ```
 
-Switch back with `git switch main` before building or deploying the maintained server/dashboard.
+Its APK is written to `android-app-legacy\app\build\outputs\apk\debug\app-debug.apk`. Both clients are built directly from `main`; no branch switch is required.
 
 ### First phone setup
 
@@ -249,14 +249,15 @@ Switch back with `git switch main` before building or deploying the maintained s
 
 ## 中文
 
-### 维护中的分支
+### 维护中的组件
 
-| 分支 | Android 支持 | 手机视频默认归档上限 | 相机实现 | 负责范围 |
+| 路径 | Android 支持 | 手机视频默认归档上限 | 相机实现 | 负责范围 |
 |---|---:|---:|---|---|
-| `main` | Android 8.0 / API 26+ | 25 GiB | 前台预览录制使用 CameraX；后台录像和 Live Access 使用 Camera2 | 维护中的 Android 客户端、API、网页管理页、Docker 部署和文档 |
-| `android-5-compatible` | Android 5.0 / API 21+ | 5.5 GiB | Android 5/5.1 使用旧 `android.hardware.Camera`；更高版本系统才使用 Camera2 | 只维护 Android 5 客户端 |
+| `android-app/` | Android 8.0 / API 26+ | 25 GiB | 前台预览录制使用 CameraX；后台录像和 Live Access 使用 Camera2 | 当前 Android 客户端 |
+| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | Android 5/5.1 使用旧 `android.hardware.Camera`；更高版本系统才使用 Camera2 | Android 5 兼容客户端 |
+| `server/`、`web-dashboard/`、`transcription-worker/` | 两个客户端 | 服务端设置 | 共用 API 和网页 | 服务端、管理页和转写 |
 
-`android-5-compatible` 分支里的服务端、网页、Docker 和部署文档都是历史快照，不应继续更新或部署；部署请使用 `main`。
+两个 Android 客户端现在都在 `main` 中维护。旧 `android-5-compatible` 分支只作为历史备份保留，不再用于开发或部署。
 
 ### 项目架构
 
@@ -289,7 +290,7 @@ React 管理页面（Docker 默认端口 8080）
 - 视频分段可选 1、3、5、10 分钟、无限或自定义；默认 5 分钟。
 - 音频分段可选 5、10、15、30、60 分钟、无限或自定义；默认 30 分钟。
 - 视频和音频不能同时录制。
-- `main` 的视频和音频可以分别选择 GPS 模式：**关闭**、**行车记录（3 秒 / 10 米）**、**执法记录（5 秒 / 5 米）**、**音频日记（60 秒 / 100 米）**和**省电（15 秒 / 25 米）**。GPS 默认关闭，启用时需要位置权限。
+- 两个 Android 客户端的视频和音频都可以分别选择 GPS 模式：**关闭**、**行车记录（3 秒 / 10 米）**、**执法记录（5 秒 / 5 米）**、**音频日记（60 秒 / 100 米）**和**省电（15 秒 / 25 米）**。GPS 默认关闭，启用时需要位置权限。
 - 每个视频或音频片段都有自己独立的 GPS 轨迹；手机本地覆盖或删除该文件时会同时删除其定位点，上传后也与服务端对应文件绑定。
 - 本地视频/音频列表支持状态、播放、拖动、适用时的旋转、锁定和删除。
 - 桌面启动图标仍然保留，但 App 不显示在 Android 最近任务中，以减少清理其他 App 时被误划掉的概率。
@@ -309,7 +310,7 @@ React 管理页面（Docker 默认端口 8080）
 
 #### 手机本地容量与上传
 
-- `main` 的本地视频默认上限是 **25 GiB**，`android-5-compatible` 默认是 **5.5 GiB**；音频使用独立的 **1.5 GiB** 默认上限。
+- `android-app/` 的本地视频默认上限是 **25 GiB**，`android-app-legacy/` 默认是 **5.5 GiB**；音频使用独立的 **1.5 GiB** 默认上限。
 - 手机端可自行修改视频和音频上限。建议的合计最大值为：本地视频/音频已占用容量，加上当前可用空间，再预留 1 GiB。
 - 保存更低的上限不会立即删除现有文件；新设置会在以后触发录制清理时生效。
 - 每段新视频开始前会检查视频归档和文件系统剩余空间；剩余空间低于 1 GiB 会触发清理检查。
@@ -326,7 +327,7 @@ React 管理页面（Docker 默认端口 8080）
 - 只有手机当前没有录制视频或音频时，网页才能请求直播画面。
 - 直播窗口支持旋转、全屏；所选后摄支持手电时可直接控制手机手电。
 - 手电可手动关闭；关闭直播窗口、网页变为不可见、控制连接断开或相机释放时，都会自动关闭。
-- `main` 的直播和手电使用 Camera2；Android 5/5.1 兼容客户端使用旧 Camera API 及其手电设置。
+- `android-app/` 的直播和手电使用 Camera2；`android-app-legacy/` 在 Android 5/5.1 上使用旧 Camera API 及其手电设置。
 - 手机会在本地记录电池温度历史；手机端和网页端都可查看图表及指定采样点。
 
 ### 服务端和网页功能
@@ -335,7 +336,7 @@ React 管理页面（Docker 默认端口 8080）
 - 支持 Range 播放、播放旋转、原视频下载、带时间戳的视频下载，以及 session 下载/导出。
 - 将相邻录制分组为 session 连续播放，同时保留单个文件控制。
 - 视频和音频会显示来源设备；网页可改成其他已知设备、`Unknown` 或留空，session 不会跨不同来源设备分组。
-- 有 GPS 数据的文件可以在网页端查看轨迹摘要并下载 GPX；只有用户主动打开 OpenStreetMap 链接时，浏览器才会访问第三方地图服务。
+- 有 GPS 数据的文件可以在交互式 OpenStreetMap 上查看轨迹、轨迹摘要并下载 GPX；只在用户打开 GPS 轨迹时加载地图图块。
 - 支持多选、批量锁定/解锁、批量旋转视频和批量删除。
 - 使用 `ffmpeg` 生成和缓存音频波形。
 - 最长 30 分钟的音频可以一键转文字，支持语言识别、带时间的 `Speaker 1` / `Speaker 2` 说话人分离、查看文字稿、下载 TXT 和单独删除文字稿而不删除音频。Docker 默认使用 CUDA 运行 `faster-whisper`，并可在本机使用 `pyannote.audio` 进行说话人分离。
@@ -461,12 +462,11 @@ adb -s PHONE_SERIAL install -r app\build\outputs\apk\debug\app-debug.apk
 构建 Android 5 客户端：
 
 ```powershell
-git switch android-5-compatible
-cd android-app
+cd android-app-legacy
 .\gradlew.bat assembleDebug
 ```
 
-构建或部署维护中的服务端/网页前，使用 `git switch main` 切回主分支。
+APK 输出到 `android-app-legacy\app\build\outputs\apk\debug\app-debug.apk`。两个客户端都直接从 `main` 构建，无需切换分支。
 
 ### 手机首次设置
 
