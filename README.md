@@ -93,7 +93,7 @@ Start alerts are configured independently of the recording mode. The choices are
 - Range-enabled playback, playback rotation, original downloads, timestamp-overlay video downloads, and session downloads/exports.
 - Group nearby recordings into sessions for continuous video or audio playback while retaining individual controls.
 - Video and audio rows show their source device. The source can be changed to another known device, `Unknown`, or blank; session grouping never crosses a source-device boundary.
-- Recordings with GPS data expose an interactive OpenStreetMap route, route summary, and GPX download. During individual video or audio playback, the map follows the recording time, highlights the travelled route, and lets the user click the route to seek. Map tiles load only when the user opens a GPS track or plays GPS-enabled media.
+- Recordings with GPS data expose an interactive OpenStreetMap route, route summary, and GPX download. During individual or grouped-session video and audio playback, the map follows the playback time, highlights the travelled route, and lets the user click the route to seek. Session gaps and segments without GPS data have no current-position marker. Map tiles load only when the user opens a GPS track or plays GPS-enabled media.
 - Bulk select, lock/unlock, rotate videos, and delete recordings.
 - Audio waveform generation and caching through `ffmpeg`.
 - One-click transcription for audio recordings up to 30 minutes, with language detection, timestamped `Speaker 1` / `Speaker 2` separation, transcript viewing, TXT download, and transcript deletion without deleting the audio. Docker runs `faster-whisper` plus optional local `pyannote.audio` speaker diarization, configured for CUDA by default.
@@ -336,7 +336,7 @@ React 管理页面（Docker 默认端口 8080）
 - 支持 Range 播放、播放旋转、原视频下载、带时间戳的视频下载，以及 session 下载/导出。
 - 将相邻录制分组为 session 连续播放，同时保留单个文件控制。
 - 视频和音频会显示来源设备；网页可改成其他已知设备、`Unknown` 或留空，session 不会跨不同来源设备分组。
-- 有 GPS 数据的文件可以在交互式 OpenStreetMap 上查看轨迹、轨迹摘要并下载 GPX。单独播放视频或音频时，地图会随录制时间移动、突出显示已经走过的路线，也可以点击轨迹跳到对应时刻；只有打开轨迹或播放带 GPS 的媒体时才加载地图图块。
+- 有 GPS 数据的文件可以在交互式 OpenStreetMap 上查看轨迹、轨迹摘要并下载 GPX。单独播放或按 session 连续播放视频、音频时，地图会随播放时间移动、突出显示已经走过的路线，也可以点击轨迹跳到对应时刻。片段间隔或没有 GPS 数据的片段不显示当前位置；只有打开轨迹或播放带 GPS 的媒体时才加载地图图块。
 - 支持多选、批量锁定/解锁、批量旋转视频和批量删除。
 - 使用 `ffmpeg` 生成和缓存音频波形。
 - 最长 30 分钟的音频可以一键转文字，支持语言识别、带时间的 `Speaker 1` / `Speaker 2` 说话人分离、查看文字稿、下载 TXT 和单独删除文字稿而不删除音频。Docker 默认使用 CUDA 运行 `faster-whisper`，并可在本机使用 `pyannote.audio` 进行说话人分离。

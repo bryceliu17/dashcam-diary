@@ -1072,10 +1072,18 @@ class MainActivity : ComponentActivity() {
             setPadding(0, 0, 0, dp(10))
         })
 
+        var selectedGpsAudio: AudioFileInfo? = null
+        val gpsPointsButton = actionButton("GPS points") {
+            selectedGpsAudio?.record?.let { record ->
+                showRecordingGpsPoints(record.recordingUuid, record.filename, record.startTime)
+            }
+        }.apply { isEnabled = false }
         val audioList = ListView(this).apply {
             adapter = createAudioListAdapter(audioFiles)
             dividerHeight = 1
             setOnItemClickListener { _, _, position, _ ->
+                selectedGpsAudio = audioFiles[position]
+                gpsPointsButton.isEnabled = selectedGpsAudio?.record != null
                 toggleAudioPlayback(audioFiles[position].file)
             }
             setOnItemLongClickListener { _, _, position, _ ->
@@ -1149,6 +1157,7 @@ class MainActivity : ComponentActivity() {
             showingAudioList = false
             buildUi()
         }, weighted())
+        controls.addView(gpsPointsButton, weighted().apply { marginStart = dp(8) })
         controls.addView(actionButton("Delete All") {
             confirmDeleteAllAudio(audioFiles)
         }, weighted().apply { marginStart = dp(8) })
@@ -1222,13 +1231,17 @@ class MainActivity : ComponentActivity() {
         val lockAction = if (record?.locked == true) "Unlock" else "Lock"
         AlertDialog.Builder(this)
             .setTitle(audio.file.name)
-            .setItems(arrayOf(lockAction, "Delete")) { _, which ->
+            .setItems(arrayOf("GPS points", lockAction, "Delete")) { _, which ->
                 if (which == 0 && record != null) {
+                    showRecordingGpsPoints(record.recordingUuid, record.filename, record.startTime)
+                } else if (which == 0) {
+                    toast("Audio record is still being indexed")
+                } else if (which == 1 && record != null) {
                     lifecycleScope.launch(Dispatchers.IO) {
                         DashcamDatabase.get(this@MainActivity).audioDao().toggleLock(record.id)
                         withContext(Dispatchers.Main) { showLocalAudio() }
                     }
-                } else if (which == 0) {
+                } else if (which == 1) {
                     toast("Audio record is still being indexed")
                 } else {
                     confirmDeleteAudio(audio.file)
@@ -1490,6 +1503,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val gpsPointsButton = actionButton("GPS points") {
+            showRecordingGpsPoints(video.recordingUuid, video.filename, video.startTime)
+        }
+        root.addView(gpsPointsButton, LinearLayout.LayoutParams(-1, dp(42)).apply { bottomMargin = dp(6) })
+
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -1516,6 +1534,7 @@ class MainActivity : ComponentActivity() {
         player.setOnFullscreenToggleListener { fullscreen ->
             title.visibility = if (fullscreen) View.GONE else View.VISIBLE
             details.visibility = if (fullscreen) View.GONE else View.VISIBLE
+            gpsPointsButton.visibility = if (fullscreen) View.GONE else View.VISIBLE
             controls.visibility = if (fullscreen) View.GONE else View.VISIBLE
             root.setPadding(if (fullscreen) 0 else dp(16), if (fullscreen) 0 else dp(16), if (fullscreen) 0 else dp(16), if (fullscreen) 0 else dp(16))
             window.decorView.systemUiVisibility = if (fullscreen) {
@@ -1531,6 +1550,52 @@ class MainActivity : ComponentActivity() {
             exitVideoFullscreen = if (fullscreen) ({ player.exitFullscreen() }) else null
         }
         setContentView(root)
+    }
+
+    private fun showRecordingGpsPoints(recordingUuid: String, filename: String, startTime: Long) {
+        lifecycleScope.launch {
+            val points = withContext(Dispatchers.IO) {
+                DashcamDatabase.get(this@MainActivity).locationPointDao().forRecording(recordingUuid)
+            }
+            if (points.isEmpty()) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("GPS points")
+                    .setMessage("No GPS points were recorded for $filename.")
+                    .setPositiveButton("Close", null)
+                    .show()
+                return@launch
+            }
+            val dateFormat = DateFormat.getDateTimeInstance(
+                DateFormat.SHORT, DateFormat.MEDIUM, Locale.getDefault()
+            )
+            val pointAdapter = object : ArrayAdapter<com.example.dashcam.data.LocationPointEntity>(
+                this@MainActivity, android.R.layout.simple_list_item_1, points
+            ) {
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val view = super.getView(position, convertView, parent) as TextView
+                    val point = getItem(position) ?: return view
+                    val elapsed = formatDuration((point.recordedAt - startTime).coerceAtLeast(0))
+                    val coordinates = String.format(Locale.US, "%.6f, %.6f", point.latitude, point.longitude)
+                    val extras = buildList {
+                        add("±${point.accuracyMeters.toInt()} m")
+                        point.speedMetersPerSecond?.let { add(String.format(Locale.US, "%.1f km/h", it * 3.6f)) }
+                        point.bearingDegrees?.let { add("${it.toInt()}°") }
+                        point.altitudeMeters?.let { add("${it.toInt()} m altitude") }
+                        point.provider?.let { add(it) }
+                    }
+                    view.text = "${dateFormat.format(Date(point.recordedAt))}  (+$elapsed)\n$coordinates\n${extras.joinToString(" · ")}"
+                    view.textSize = 13f
+                    view.setTextColor(Color.rgb(17, 24, 39))
+                    view.setPadding(dp(12), dp(10), dp(12), dp(10))
+                    return view
+                }
+            }
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle("GPS points · ${points.size}")
+                .setAdapter(pointAdapter, null)
+                .setPositiveButton("Close", null)
+                .show()
+        }
     }
 
     private fun showSetAllPlaybackRotationDialog() {
@@ -1992,7 +2057,7 @@ class MainActivity : ComponentActivity() {
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setSingleLine(true)
-            setText(if (current > 0) current.toString() else "15")
+            setText(if (current > 0) current.toString() else "20")
             setSelection(text.length)
         }
         val dialog = AlertDialog.Builder(this)
@@ -3003,10 +3068,11 @@ class MainActivity : ComponentActivity() {
             SegmentDurationChoice("3 minutes", 3),
             SegmentDurationChoice("5 minutes", 5),
             SegmentDurationChoice("10 minutes", 10),
+            SegmentDurationChoice("15 minutes", 15),
             SegmentDurationChoice("Unlimited", VideoSegmentSettings.UNLIMITED_DURATION_MINUTES),
             SegmentDurationChoice("Custom...", null)
         )
-        private const val CUSTOM_DURATION_POSITION = 5
+        private const val CUSTOM_DURATION_POSITION = 6
         private val AUDIO_SEGMENT_DURATION_CHOICES = listOf(
             SegmentDurationChoice("5 minutes", 5),
             SegmentDurationChoice("10 minutes", 10),

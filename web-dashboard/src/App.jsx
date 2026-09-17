@@ -157,9 +157,10 @@ const gpsTimeline = (items, startTime) => {
   const startedAt = new Date(startTime).getTime()
   return items.map(point => ({
     ...point,
-    playbackSecond: Number.isFinite(startedAt)
+    playbackSecond: Number.isFinite(point.playbackSecond) ? point.playbackSecond : Number.isFinite(startedAt)
       ? Math.max(0, (new Date(point.recordedAt).getTime() - startedAt) / 1000)
       : 0,
+    routeGroup: point.routeGroup ?? 0,
   }))
 }
 
@@ -184,7 +185,7 @@ const gpsPositionAt = (timeline, playbackTime) => {
   }
 }
 
-function GpsTrackMap({ items, startTime, playbackTime, onSeek }) {
+function GpsTrackMap({ items, startTime, playbackTime, onSeek, activeGroup }) {
   const containerRef = useRef(null)
   const markerRef = useRef(null)
   const progressLineRef = useRef(null)
@@ -206,29 +207,43 @@ function GpsTrackMap({ items, startTime, playbackTime, onSeek }) {
       maxZoom: 19,
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
     }).addTo(map)
-    const route = L.polyline(coordinates, {
-      color: synchronized ? '#607079' : '#8eea55',
-      weight: 5,
-      opacity: synchronized ? 0.78 : 0.95,
-      lineCap: 'round',
-      lineJoin: 'round',
-    }).addTo(map)
+    const groups = [...new Set(timeline.map(point => point.routeGroup))]
+    const routes = groups.map(group => {
+      const groupPoints = timeline.filter(point => point.routeGroup === group)
+      const route = L.polyline(groupPoints.map(point => [point.latitude, point.longitude]), {
+        color: synchronized ? '#607079' : '#8eea55',
+        weight: 5,
+        opacity: synchronized ? 0.78 : 0.95,
+        lineCap: 'round',
+        lineJoin: 'round',
+      }).addTo(map)
+      return { group, groupPoints, route }
+    })
     if (synchronized && seekHandlerRef.current) {
-      L.polyline(coordinates, { color: '#fff', weight: 22, opacity: 0.001 })
-        .addTo(map)
-        .on('click', event => {
-          const nearest = timeline.reduce((best, point) => {
+      progressLineRef.current = new Map()
+      routes.forEach(({ group, groupPoints, route }) => {
+        const seek = event => {
+          const nearest = groupPoints.reduce((best, point) => {
             const distance = map.distance(event.latlng, [point.latitude, point.longitude])
             return !best || distance < best.distance ? { point, distance } : best
           }, null)
           if (nearest) seekHandlerRef.current?.(nearest.point.playbackSecond)
-        })
-      route.bindTooltip('Click the route to seek')
-      progressLineRef.current = L.polyline([], {
-        color: '#a9ff5c', weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round',
-      }).addTo(map)
+        }
+        route.on('click', seek).bindTooltip('Click the route to seek')
+        if (groupPoints.length > 1) {
+          L.polyline(groupPoints.map(point => [point.latitude, point.longitude]), { color: '#fff', weight: 22, opacity: 0.001 })
+            .addTo(map).on('click', seek)
+        } else {
+          L.circleMarker([groupPoints[0].latitude, groupPoints[0].longitude], {
+            radius: 10, color: '#a9ff5c', fillColor: '#a9ff5c', fillOpacity: 0.8,
+          }).addTo(map).on('click', () => seekHandlerRef.current?.(groupPoints[0].playbackSecond))
+        }
+        progressLineRef.current.set(group, L.polyline([], {
+          color: '#a9ff5c', weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round', interactive: false,
+        }).addTo(map))
+      })
       markerRef.current = L.circleMarker(coordinates[0], {
-        radius: 8, color: '#111820', weight: 3, fillColor: '#ffd166', fillOpacity: 1,
+        radius: 8, color: '#111820', weight: 3, fillColor: '#ffd166', fillOpacity: 1, interactive: false,
       }).addTo(map).bindTooltip('Current position')
     }
     L.circleMarker(coordinates[0], {
@@ -237,14 +252,14 @@ function GpsTrackMap({ items, startTime, playbackTime, onSeek }) {
       weight: 3,
       fillColor: '#66b7ff',
       fillOpacity: 1,
-    }).addTo(map).bindTooltip('Start')
+    }).addTo(map).bindTooltip('Start').on('click', () => seekHandlerRef.current?.(timeline[0].playbackSecond))
     L.circleMarker(coordinates.at(-1), {
       radius: 7,
       color: '#160707',
       weight: 3,
       fillColor: '#ff786f',
       fillOpacity: 1,
-    }).addTo(map).bindTooltip('End')
+    }).addTo(map).bindTooltip('End').on('click', () => seekHandlerRef.current?.(timeline.at(-1).playbackSecond))
 
     const bounds = L.latLngBounds(coordinates)
     if (coordinates.length === 1 || bounds.getNorthEast().equals(bounds.getSouthWest())) {
@@ -263,17 +278,27 @@ function GpsTrackMap({ items, startTime, playbackTime, onSeek }) {
 
   useEffect(() => {
     if (!synchronized || !markerRef.current || !progressLineRef.current || !timeline.length) return
-    const position = gpsPositionAt(timeline, playbackTime)
-    if (!position) return
-    const currentCoordinate = [position.latitude, position.longitude]
-    markerRef.current.setLatLng(currentCoordinate)
-    markerRef.current.setTooltipContent(`${formatTimelineDuration(playbackTime)} · ${(Number(position.speedMetersPerSecond || 0) * 3.6).toFixed(1)} km/h`)
-    const travelled = timeline
-      .filter(point => point.playbackSecond <= playbackTime)
-      .map(point => [point.latitude, point.longitude])
-    if (!travelled.length || travelled.at(-1)[0] !== currentCoordinate[0] || travelled.at(-1)[1] !== currentCoordinate[1]) travelled.push(currentCoordinate)
-    progressLineRef.current.setLatLngs(travelled)
-  }, [playbackTime, synchronized, timeline])
+    const activePoints = activeGroup === undefined ? timeline
+      : timeline.filter(point => point.routeGroup === activeGroup)
+    const position = activeGroup === null || !activePoints.length ||
+      (activeGroup !== undefined && playbackTime < activePoints[0].playbackSecond)
+      ? null : gpsPositionAt(activePoints, playbackTime)
+    markerRef.current.setStyle({ opacity: position ? 1 : 0, fillOpacity: position ? 1 : 0 })
+    if (position) {
+      markerRef.current.setLatLng([position.latitude, position.longitude])
+      markerRef.current.setTooltipContent(`${formatTimelineDuration(playbackTime)} · ${(Number(position.speedMetersPerSecond || 0) * 3.6).toFixed(1)} km/h`)
+    }
+    progressLineRef.current.forEach((line, group) => {
+      const groupPoints = timeline.filter(point => point.routeGroup === group)
+      const travelled = groupPoints.filter(point => point.playbackSecond <= playbackTime)
+        .map(point => [point.latitude, point.longitude])
+      if (position && (activeGroup === undefined || group === activeGroup) &&
+          travelled.length && groupPoints.at(-1).playbackSecond > playbackTime) {
+        travelled.push([position.latitude, position.longitude])
+      }
+      line.setLatLngs(travelled)
+    })
+  }, [activeGroup, playbackTime, synchronized, timeline])
 
   return <div ref={containerRef} className="gps-track-map" aria-label="Recorded GPS route on OpenStreetMap" />
 }
@@ -297,15 +322,69 @@ function MediaGpsPlayback({ type, recording, playbackTime, onSeek }) {
   }, [type, recording.id])
 
   const timeline = useMemo(() => gpsTimeline(track.items, recording.startTime), [track.items, recording.startTime])
-  const position = useMemo(() => gpsPositionAt(timeline, playbackTime), [timeline, playbackTime])
+  return <GpsPlaybackPanel items={timeline} loading={track.loading} error={track.error} playbackTime={playbackTime} onSeek={onSeek} />
+}
+
+function SessionGpsPlayback({ type, recordings, entries, playbackTime, activeGroup, onSeek }) {
+  const [track, setTrack] = useState({ loading: true, error: '', items: [] })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const withGps = recordings.map((recording, index) => ({ recording, index }))
+      .filter(({ recording }) => Number(recording.gpsPointCount) > 0)
+    setTrack({ loading: true, error: '', items: [] })
+    let next = 0
+    let failures = 0
+    const grouped = new Array(recordings.length)
+    const loadNext = async () => {
+      while (!controller.signal.aborted && next < withGps.length) {
+        const { recording, index } = withGps[next++]
+        try {
+          const response = await fetch(`${API}/api/${type}/${recording.id}/locations`, { signal: controller.signal })
+          if (!response.ok) throw new Error(`GPS request failed (${response.status})`)
+          const result = await response.json()
+          const entry = entries[index]
+          const startedAt = new Date(recording.startTime).getTime()
+          grouped[index] = (result.items || []).map(point => ({
+            ...point,
+            routeGroup: index,
+            playbackSecond: entry.start + Math.min(entry.duration, Math.max(0,
+              (new Date(point.recordedAt).getTime() - startedAt) / 1000)),
+          }))
+        } catch (error) {
+          if (error.name === 'AbortError') return
+          failures += 1
+        }
+      }
+    }
+    Promise.all(Array.from({ length: Math.min(4, withGps.length) }, loadNext)).then(() => {
+      if (!controller.signal.aborted) setTrack({
+        loading: false,
+        error: failures ? `${failures} GPS track${failures === 1 ? '' : 's'} unavailable` : '',
+        items: grouped.flat().filter(Boolean),
+      })
+    })
+    return () => controller.abort()
+  }, [type, recordings, entries])
+
+  return <GpsPlaybackPanel items={track.items} loading={track.loading} error={track.error}
+    playbackTime={playbackTime} activeGroup={activeGroup} onSeek={onSeek} />
+}
+
+function GpsPlaybackPanel({ items, loading, error, playbackTime, activeGroup, onSeek }) {
+  const activePoints = useMemo(() => activeGroup === undefined ? items
+    : items.filter(point => point.routeGroup === activeGroup), [items, activeGroup])
+  const position = useMemo(() => activeGroup === null || !activePoints.length ||
+    (activeGroup !== undefined && playbackTime < activePoints[0].playbackSecond)
+    ? null : gpsPositionAt(activePoints, playbackTime), [activeGroup, activePoints, playbackTime])
 
   return <aside className="gps-playback-panel">
     <div className="gps-playback-heading"><strong>GPS playback</strong><span>Click route to seek</span></div>
-    {track.loading ? <div className="gps-playback-state"><div className="spinner" /><span>Loading GPS…</span></div>
-      : track.error ? <div className="gps-playback-state error">{track.error}</div>
-        : track.items.length === 0 ? <div className="gps-playback-state">No GPS points</div>
+    {loading ? <div className="gps-playback-state"><div className="spinner" /><span>Loading GPS…</span></div>
+      : items.length === 0 ? <div className="gps-playback-state">{error || 'No GPS points'}</div>
           : <>
-            <GpsTrackMap items={track.items} startTime={recording.startTime} playbackTime={playbackTime} onSeek={onSeek} />
+            <GpsTrackMap items={items} playbackTime={playbackTime} activeGroup={activeGroup} onSeek={onSeek} />
+            {error && <div className="gps-playback-warning">{error}</div>}
             <div className="gps-playback-readout">
               <span>Position<strong>{position ? `${position.latitude.toFixed(6)}, ${position.longitude.toFixed(6)}` : '--'}</strong></span>
               <span>Speed<strong>{position ? `${(Number(position.speedMetersPerSecond || 0) * 3.6).toFixed(1)} km/h` : '--'}</strong></span>
@@ -313,6 +392,12 @@ function MediaGpsPlayback({ type, recording, playbackTime, onSeek }) {
             </div>
           </>}
   </aside>
+}
+
+function GpsVisibilityButton({ visible, onToggle }) {
+  return <button type="button" className="gps-visibility-button" aria-expanded={visible} onClick={onToggle}>
+    <Icon name="location" />{visible ? 'Hide map' : 'Show map'}
+  </button>
 }
 
 function GpsTrackViewer({ track, onClose }) {
@@ -718,6 +803,8 @@ function RotatedVideo({
 
 function SessionPlayback({ session }) {
   const clips = session.videos
+  const hasGps = clips.some(clip => Number(clip.gpsPointCount) > 0)
+  const [mapVisible, setMapVisible] = useState(true)
   const sessionPlayerRef = useRef(null)
   const scrubbingRef = useRef(false)
   const previewTimerRef = useRef(null)
@@ -892,7 +979,10 @@ function SessionPlayback({ session }) {
     </div>
   </>
 
-  return <div className="session-playback" ref={sessionPlayerRef}>
+  return <div className={`session-playback ${hasGps && mapVisible ? 'has-gps' : ''}`} ref={sessionPlayerRef}>
+    {hasGps && <div className="session-map-toolbar"><GpsVisibilityButton visible={mapVisible} onToggle={() => setMapVisible(current => !current)} /></div>}
+    <div className="session-playback-grid">
+    <div className="session-playback-main">
     <RotatedVideo
       src={`${API}/api/videos/${clip.id}/stream`}
       rotation={clip.playbackRotationDegrees || 0}
@@ -911,6 +1001,10 @@ function SessionPlayback({ session }) {
       fullscreenTargetRef={sessionPlayerRef}
       blackout={Boolean(gapEntry)}
     />
+    </div>
+    {hasGps && mapVisible && <SessionGpsPlayback type="videos" recordings={clips} entries={timeline.clipEntries}
+      playbackTime={displayedPosition} activeGroup={gapEntry ? null : clipIndex} onSeek={seekSession} />}
+    </div>
   </div>
 }
 
@@ -1084,13 +1178,14 @@ function VideoPlaybackModal({ recording, onClose, onRotate }) {
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
   const hasGps = Number(recording.gpsPointCount) > 0
+  const [mapVisible, setMapVisible] = useState(true)
   const seekFromMap = useCallback(time => {
     setPlaybackTime(time)
     setSeekRequest(current => ({ time, version: current.version + 1 }))
   }, [])
 
-  return <div className="modal" onMouseDown={onClose}><div ref={fullscreenRef} className={`player media-playback-modal ${hasGps ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
-    <div><strong>{recording.originalFilename || recording.filename}</strong><span className="player-actions"><button className="rotate-control" title="Rotate playback clockwise by 90 degrees" onClick={() => onRotate(recording)}><Icon name="rotate" /><span>Rotate 90 deg</span></button><button className="close-player" aria-label="Close player" onClick={onClose}>X</button></span></div>
+  return <div className="modal" onMouseDown={onClose}><div ref={fullscreenRef} className={`player media-playback-modal ${hasGps && mapVisible ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
+    <div><strong>{recording.originalFilename || recording.filename}</strong><span className="player-actions"><button className="rotate-control" title="Rotate playback clockwise by 90 degrees" onClick={() => onRotate(recording)}><Icon name="rotate" /><span>Rotate 90 deg</span></button>{hasGps && <GpsVisibilityButton visible={mapVisible} onToggle={() => setMapVisible(current => !current)} />}<button className="close-player" aria-label="Close player" onClick={onClose}>X</button></span></div>
     <div className="media-playback-grid">
       <div className="media-playback-main">
         <RotatedVideo
@@ -1105,7 +1200,7 @@ function VideoPlaybackModal({ recording, onClose, onRotate }) {
         />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)} | Playback {recording.playbackRotationDegrees || 0} deg</p>
       </div>
-      {hasGps && <MediaGpsPlayback type="videos" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+      {hasGps && mapVisible && <MediaGpsPlayback type="videos" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
     </div>
   </div></div>
 }
@@ -1114,19 +1209,20 @@ function AudioPlaybackModal({ recording, onClose }) {
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
   const hasGps = Number(recording.gpsPointCount) > 0
+  const [mapVisible, setMapVisible] = useState(true)
   const seekFromMap = useCallback(time => {
     setPlaybackTime(time)
     setSeekRequest(current => ({ time, version: current.version + 1 }))
   }, [])
 
-  return <div className="modal" onMouseDown={onClose}><div className={`player media-playback-modal audio-player-modal ${hasGps ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
-    <div><strong>{recording.originalFilename || recording.filename}</strong><button className="close-player" aria-label="Close player" onClick={onClose}>X</button></div>
+  return <div className="modal" onMouseDown={onClose}><div className={`player media-playback-modal audio-player-modal ${hasGps && mapVisible ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
+    <div><strong>{recording.originalFilename || recording.filename}</strong><span className="player-actions">{hasGps && <GpsVisibilityButton visible={mapVisible} onToggle={() => setMapVisible(current => !current)} />}<button className="close-player" aria-label="Close player" onClick={onClose}>X</button></span></div>
     <div className="media-playback-grid">
       <div className="media-playback-main">
         <WaveformAudio key={recording.id} recording={recording} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)}</p>
       </div>
-      {hasGps && <MediaGpsPlayback type="audio" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+      {hasGps && mapVisible && <MediaGpsPlayback type="audio" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
     </div>
   </div></div>
 }
@@ -1179,8 +1275,62 @@ function TranscriptViewer({ transcript, onClose, onDelete, onRenameSpeakers }) {
   </div></div>
 }
 
+function SessionTranscript({ recordings, entries, playbackTime, onSeek }) {
+  const [transcripts, setTranscripts] = useState({})
+  const [timestampMode, setTimestampMode] = useState('recorded')
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const ready = recordings.filter(recording => recording.transcriptStatus === 'ready')
+    let nextIndex = 0
+    setTranscripts({})
+    const loadNext = async () => {
+      while (!controller.signal.aborted && nextIndex < ready.length) {
+        const recording = ready[nextIndex++]
+        try {
+          const transcript = await api(`/api/audio/${recording.id}/transcription`, { signal: controller.signal })
+          if (!controller.signal.aborted) setTranscripts(current => ({ ...current, [recording.id]: { transcript } }))
+        } catch (error) {
+          if (!controller.signal.aborted) setTranscripts(current => ({ ...current, [recording.id]: { error: error.message } }))
+        }
+      }
+    }
+    Promise.all([loadNext(), loadNext(), loadNext()])
+    return () => controller.abort()
+  }, [recordings])
+
+  const readyCount = recordings.filter(recording => recording.transcriptStatus === 'ready').length
+  return <section className="audio-session-transcript" aria-label="Session transcript">
+    <div className="audio-session-transcript-head"><strong>Session transcript · {readyCount}/{recordings.length} ready</strong>
+      <div className="transcript-time-mode"><span>Timeline</span><button type="button" className={timestampMode === 'recorded' ? 'active' : ''} onClick={() => setTimestampMode('recorded')}>Recorded clock</button><button type="button" className={timestampMode === 'session' ? 'active' : ''} onClick={() => setTimestampMode('session')}>Session time</button></div>
+    </div>
+    {recordings.map((recording, index) => {
+      const entry = entries[index]
+      const result = transcripts[recording.id]
+      const transcript = result?.transcript
+      const segments = Array.isArray(transcript?.segments) ? transcript.segments.filter(segment => segment?.text) : []
+      return <div className="audio-session-transcript-file" key={recording.id}>
+        <div className="audio-session-transcript-file-head"><strong>{index + 1}. {recording.originalFilename || recording.filename}</strong><span>{formatDate(recording.startTime)}</span></div>
+        {recording.transcriptStatus !== 'ready' ? <p className="audio-session-transcript-placeholder">{['queued', 'processing'].includes(recording.transcriptStatus) ? 'Transcription in progress.' : recording.transcriptStatus === 'failed' ? 'Transcription failed.' : 'No transcript for this recording.'}</p>
+          : result?.error ? <p className="audio-session-transcript-placeholder">Could not load transcript: {result.error}</p>
+          : !transcript ? <p className="audio-session-transcript-placeholder">Loading transcript…</p>
+          : segments.length ? <div className="transcript-segments">{segments.map((segment, segmentIndex) => {
+            const start = entry.start + (Number(segment.start) || 0)
+            const end = entry.start + (Number(segment.end) || 0)
+            const active = playbackTime >= start && playbackTime < end
+            const startLabel = timestampMode === 'recorded' ? formatPlaybackTimestamp(recording.startTime, segment.start) : formatTranscriptTimestamp(start)
+            const endLabel = timestampMode === 'recorded' ? formatPlaybackTimestamp(recording.startTime, segment.end) : formatTranscriptTimestamp(end)
+            return <button type="button" className={`${segment.speaker ? 'has-speaker ' : ''}${active ? 'active' : ''}`} key={`${segment.start}-${segmentIndex}`} onClick={() => onSeek(start)} aria-label={`Play session from ${startLabel}`}><time>{startLabel} – {endLabel}</time>{segment.speaker && <strong>{segment.speaker}</strong>}<p>{segment.text}</p></button>
+          })}</div> : <p className="audio-session-transcript-placeholder">{transcript.text || 'No speech was detected in this recording.'}</p>}
+      </div>
+    })}
+  </section>
+}
+
 function AudioSessionPlayback({ session }) {
   const recordings = session.recordings
+  const hasGps = recordings.some(recording => Number(recording.gpsPointCount) > 0)
+  const [mapVisible, setMapVisible] = useState(true)
   const audioRef = useRef(null)
   const waveformCanvasRef = useRef(null)
   const resumeAfterScrub = useRef(true)
@@ -1199,6 +1349,7 @@ function AudioSessionPlayback({ session }) {
   const [waveformLoading, setWaveformLoading] = useState(true)
   const [waveformError, setWaveformError] = useState('')
   const [waveformCanvasSize, setWaveformCanvasSize] = useState({ width: 0, height: 0 })
+  const [transcriptOpen, setTranscriptOpen] = useState(false)
   const recording = recordings[recordingIndex]
   const timeline = useMemo(() => {
     const entries = []
@@ -1468,10 +1619,14 @@ function AudioSessionPlayback({ session }) {
     setPlaybackRate(Number(event.target.value))
   }
 
-  return <div className="audio-session-playback">
+  return <div className={`audio-session-playback ${hasGps && mapVisible ? 'has-gps' : ''} ${transcriptOpen ? 'with-transcript' : ''}`}>
+    <div className="session-playback-grid">
+    <div className="session-playback-main">
     <div className="session-playback-status">
       <strong>{gapEntry ? 'Silent interval' : finished ? 'Session complete' : `Recording ${recordingIndex + 1} of ${recordings.length}`}</strong>
       <span>{gapEntry ? `${gapEntry.duration.toFixed(1)}s gap` : recording.originalFilename || recording.filename}</span>
+      {hasGps && <GpsVisibilityButton visible={mapVisible} onToggle={() => setMapVisible(current => !current)} />}
+      <button type="button" className="session-transcript-toggle" aria-expanded={transcriptOpen} onClick={() => setTranscriptOpen(current => !current)}>{transcriptOpen ? 'Hide transcript' : 'View transcript'}</button>
     </div>
     <div className={`audio-session-stage ${gapEntry ? 'silent' : ''}`}>
       <div
@@ -1533,6 +1688,11 @@ function AudioSessionPlayback({ session }) {
         </select>
       </div>
     </div>
+    </div>
+    {hasGps && mapVisible && <SessionGpsPlayback type="audio" recordings={recordings} entries={timeline.recordingEntries}
+      playbackTime={displayedPosition} activeGroup={gapEntry ? null : recordingIndex} onSeek={seekSession} />}
+    </div>
+    {transcriptOpen && <SessionTranscript recordings={recordings} entries={timeline.recordingEntries} playbackTime={displayedPosition} onSeek={seekSession} />}
   </div>
 }
 
@@ -3156,13 +3316,13 @@ export default function App() {
       } : device))}
     />}
     {selected && <VideoPlaybackModal recording={selected} onClose={() => setSelected(null)} onRotate={rotatePlayback} />}
-    {selectedSession && <div className="modal" onMouseDown={() => setSelectedSession(null)}><div className="player" onMouseDown={event => event.stopPropagation()}>
+    {selectedSession && <div className="modal" onMouseDown={() => setSelectedSession(null)}><div className={`player session-player ${selectedSession.videos.some(video => Number(video.gpsPointCount) > 0) ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedSession.number} · {selectedSession.count} {selectedSession.count === 1 ? 'video' : 'videos'}</strong><span className="player-actions"><button className="close-player" aria-label="Close session player" onClick={() => setSelectedSession(null)}>X</button></span></div>
       <SessionPlayback key={selectedSession.number} session={selectedSession} />
       <p>{formatDate(selectedSession.videos[0].startTime)} to {formatDate(selectedSession.videos.at(-1).endTime)} | {formatTotalDuration(selectedSession.durationSeconds)} including short black intervals</p>
     </div></div>}
     {selectedAudio && <AudioPlaybackModal recording={selectedAudio} onClose={() => setSelectedAudio(null)} />}
-    {selectedAudioSession && <div className="modal" onMouseDown={() => setSelectedAudioSession(null)}><div className="player audio-session-player" onMouseDown={event => event.stopPropagation()}>
+    {selectedAudioSession && <div className="modal" onMouseDown={() => setSelectedAudioSession(null)}><div className={`player audio-session-player ${selectedAudioSession.recordings.some(recording => Number(recording.gpsPointCount) > 0) ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedAudioSession.number} | {selectedAudioSession.count} {selectedAudioSession.count === 1 ? 'recording' : 'recordings'}</strong><button className="close-player" aria-label="Close audio session player" onClick={() => setSelectedAudioSession(null)}>X</button></div>
       <AudioSessionPlayback key={selectedAudioSession.number} session={selectedAudioSession} />
       <p>{formatDate(selectedAudioSession.recordings[0].startTime)} to {formatDate(selectedAudioSession.recordings.at(-1).endTime)} | {formatTotalDuration(selectedAudioSession.durationSeconds)} including short silent intervals</p>
