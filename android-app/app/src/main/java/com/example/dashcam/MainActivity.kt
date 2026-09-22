@@ -76,6 +76,7 @@ import com.example.dashcam.recording.BackgroundVideoQualitySettings
 import com.example.dashcam.recording.AudioRecordingService
 import com.example.dashcam.recording.AudioSegmentSettings
 import com.example.dashcam.recording.AudioStoragePolicy
+import com.example.dashcam.recording.LockScreenRecordingIndicator
 import com.example.dashcam.recording.PowerMonitorService
 import com.example.dashcam.recording.PowerRecordingSettings
 import com.example.dashcam.recording.RemoteRecordingControl
@@ -675,6 +676,20 @@ class MainActivity : ComponentActivity() {
             }
         }
         root.addView(startAlertSpinner, LinearLayout.LayoutParams(-1, dp(52)))
+        root.addView(actionButton(
+            if (LockScreenRecordingIndicator.isEnabled(this)) "Lock screen recording status: On"
+            else "Lock screen recording status: Off"
+        ) {
+            val enabled = !LockScreenRecordingIndicator.isEnabled(this)
+            LockScreenRecordingIndicator.setEnabled(this, enabled)
+            keepHomeScrollPosition { buildUi() }
+        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) })
+        root.addView(TextView(this).apply {
+            text = "Shows video/audio recording on the lock screen without controls. Your phone's lock screen notification setting must also allow it."
+            textSize = 12f
+            setTextColor(Color.rgb(75, 85, 99))
+            setPadding(0, dp(4), 0, dp(4))
+        })
         settingsContainer.addView(TextView(this).apply {
             text = "Background Video Quality"
             textSize = 12f

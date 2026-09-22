@@ -545,6 +545,7 @@ class BackgroundRecordingService : Service() {
         .setContentTitle("Dashcam Diary background recording")
         .setContentText(text)
         .setOngoing(true)
+        .setVisibility(NotificationCompat.VISIBILITY_SECRET)
         .setContentIntent(PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             pendingIntentFlags()

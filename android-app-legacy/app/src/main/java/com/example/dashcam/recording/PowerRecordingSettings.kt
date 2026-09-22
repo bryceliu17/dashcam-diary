@@ -105,6 +105,7 @@ object PowerRecordingSettings {
             .putBoolean(KEY_FOREGROUND_RECORDING_ACTIVE, active)
             .putBoolean(KEY_LEGACY_RECORDING_ACTIVE, active || backgroundActive)
             .apply()
+        LockScreenRecordingIndicator.sync(context)
     }
 
     fun setBackgroundRecordingActive(context: Context, active: Boolean) {
@@ -114,10 +115,12 @@ object PowerRecordingSettings {
             .putBoolean(KEY_BACKGROUND_RECORDING_ACTIVE, active)
             .putBoolean(KEY_LEGACY_RECORDING_ACTIVE, active || foregroundActive)
             .apply()
+        LockScreenRecordingIndicator.sync(context)
     }
 
     fun setAudioRecordingActive(context: Context, active: Boolean) {
         prefs(context).edit().putBoolean(KEY_AUDIO_RECORDING_ACTIVE, active).apply()
+        LockScreenRecordingIndicator.sync(context)
     }
 
     private fun isVideoRecordingActive(preferences: android.content.SharedPreferences): Boolean =

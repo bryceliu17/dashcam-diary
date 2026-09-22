@@ -340,6 +340,7 @@ class RecordingService : LifecycleService() {
         .setContentTitle("Dashcam Diary recording")
         .setContentText("Video segments: ${VideoSegmentSettings.displayLabel(this)}")
         .setOngoing(true)
+        .setVisibility(NotificationCompat.VISIBILITY_SECRET)
         .setContentIntent(PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE

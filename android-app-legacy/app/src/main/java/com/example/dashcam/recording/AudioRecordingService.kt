@@ -312,6 +312,7 @@ class AudioRecordingService : Service() {
         .setContentTitle("Dashcam Diary audio recording")
         .setContentText(text)
         .setOngoing(true)
+        .setVisibility(NotificationCompat.VISIBILITY_SECRET)
         .setContentIntent(
             PendingIntent.getActivity(
                 this, 0, Intent(this, MainActivity::class.java),
