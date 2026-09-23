@@ -185,6 +185,23 @@ const gpsPositionAt = (timeline, playbackTime) => {
   }
 }
 
+const gpsPositionForPlayback = (items, playbackTime, activeGroup) => {
+  if (activeGroup === null) return null
+  const activePoints = activeGroup === undefined
+    ? items
+    : items.filter(point => point.routeGroup === activeGroup)
+  if (!activePoints.length || (activeGroup !== undefined && playbackTime < activePoints[0].playbackSecond)) return null
+  return gpsPositionAt(activePoints, playbackTime)
+}
+
+function PlaybackGpsValue({ track, playbackTime, activeGroup }) {
+  if (!track) return null
+  const position = gpsPositionForPlayback(track.items, playbackTime, activeGroup)
+  const value = track.loading ? 'Loading…'
+    : position ? `${position.latitude.toFixed(6)}, ${position.longitude.toFixed(6)}` : '--'
+  return <><small>Coordinates</small><strong className="playback-coordinate">{value}</strong></>
+}
+
 function GpsTrackMap({ items, startTime, playbackTime, onSeek, activeGroup }) {
   const containerRef = useRef(null)
   const markerRef = useRef(null)
@@ -303,10 +320,14 @@ function GpsTrackMap({ items, startTime, playbackTime, onSeek, activeGroup }) {
   return <div ref={containerRef} className="gps-track-map" aria-label="Recorded GPS route on OpenStreetMap" />
 }
 
-function MediaGpsPlayback({ type, recording, playbackTime, onSeek }) {
+function useMediaGpsTrack(type, recording, enabled) {
   const [track, setTrack] = useState({ loading: true, error: '', items: [] })
 
   useEffect(() => {
+    if (!enabled) {
+      setTrack({ loading: false, error: '', items: [] })
+      return undefined
+    }
     const controller = new AbortController()
     setTrack({ loading: true, error: '', items: [] })
     fetch(`${API}/api/${type}/${recording.id}/locations`, { signal: controller.signal })
@@ -319,16 +340,24 @@ function MediaGpsPlayback({ type, recording, playbackTime, onSeek }) {
         if (error.name !== 'AbortError') setTrack({ loading: false, error: 'GPS track unavailable', items: [] })
       })
     return () => controller.abort()
-  }, [type, recording.id])
+  }, [enabled, type, recording.id])
 
   const timeline = useMemo(() => gpsTimeline(track.items, recording.startTime), [track.items, recording.startTime])
-  return <GpsPlaybackPanel items={timeline} loading={track.loading} error={track.error} playbackTime={playbackTime} onSeek={onSeek} />
+  return { ...track, items: timeline }
 }
 
-function SessionGpsPlayback({ type, recordings, entries, playbackTime, activeGroup, onSeek }) {
+function MediaGpsPlayback({ track, playbackTime, onSeek }) {
+  return <GpsPlaybackPanel items={track.items} loading={track.loading} error={track.error} playbackTime={playbackTime} onSeek={onSeek} />
+}
+
+function useSessionGpsTrack(type, recordings, entries, enabled) {
   const [track, setTrack] = useState({ loading: true, error: '', items: [] })
 
   useEffect(() => {
+    if (!enabled) {
+      setTrack({ loading: false, error: '', items: [] })
+      return undefined
+    }
     const controller = new AbortController()
     const withGps = recordings.map((recording, index) => ({ recording, index }))
       .filter(({ recording }) => Number(recording.gpsPointCount) > 0)
@@ -365,18 +394,18 @@ function SessionGpsPlayback({ type, recordings, entries, playbackTime, activeGro
       })
     })
     return () => controller.abort()
-  }, [type, recordings, entries])
+  }, [enabled, type, recordings, entries])
 
+  return track
+}
+
+function SessionGpsPlayback({ track, playbackTime, activeGroup, onSeek }) {
   return <GpsPlaybackPanel items={track.items} loading={track.loading} error={track.error}
     playbackTime={playbackTime} activeGroup={activeGroup} onSeek={onSeek} />
 }
 
 function GpsPlaybackPanel({ items, loading, error, playbackTime, activeGroup, onSeek }) {
-  const activePoints = useMemo(() => activeGroup === undefined ? items
-    : items.filter(point => point.routeGroup === activeGroup), [items, activeGroup])
-  const position = useMemo(() => activeGroup === null || !activePoints.length ||
-    (activeGroup !== undefined && playbackTime < activePoints[0].playbackSecond)
-    ? null : gpsPositionAt(activePoints, playbackTime), [activeGroup, activePoints, playbackTime])
+  const position = useMemo(() => gpsPositionForPlayback(items, playbackTime, activeGroup), [activeGroup, items, playbackTime])
 
   return <aside className="gps-playback-panel">
     <div className="gps-playback-heading"><strong>GPS playback</strong><span>Click route to seek</span></div>
@@ -641,6 +670,9 @@ function RotatedVideo({
   onPlaybackRateChange,
   fullscreenTargetRef,
   blackout = false,
+  gpsTrack,
+  gpsPlaybackTime,
+  gpsActiveGroup,
 }) {
   const playerRef = useRef(null)
   const stageRef = useRef(null)
@@ -789,7 +821,7 @@ function RotatedVideo({
           <Icon name={playing ? 'pause' : 'play'} />
         </button>
         <span>{formatTimelineDuration(controlTime ?? currentTime)} / {formatTimelineDuration(controlDuration ?? duration)}</span>
-        <span className="playback-timestamp"><small>Recorded time</small><strong>{formatPlaybackTimestamp(startTime, currentTime)}</strong></span>
+        <span className="playback-timestamp"><small>Recorded time</small><strong>{formatPlaybackTimestamp(startTime, currentTime)}</strong><PlaybackGpsValue track={gpsTrack} playbackTime={gpsPlaybackTime ?? currentTime} activeGroup={gpsActiveGroup} /></span>
         <select className="playback-rate" value={playbackRate} onChange={changePlaybackRate} aria-label="Playback speed" title="Playback speed">
           {[0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4].map(rate => <option value={rate} key={rate}>{rate}x</option>)}
         </select>
@@ -841,6 +873,7 @@ function SessionPlayback({ session }) {
   }, [clips])
   const gapEntry = gapEntryIndex == null ? null : timeline.entries[gapEntryIndex]
   const currentClipEntry = timeline.clipEntries[clipIndex]
+  const gpsTrack = useSessionGpsTrack('videos', clips, timeline.clipEntries, hasGps)
 
   useEffect(() => {
     if (!gapEntry || scrubPosition !== null) return undefined
@@ -1000,15 +1033,18 @@ function SessionPlayback({ session }) {
       onPlaybackRateChange={changeSessionPlaybackRate}
       fullscreenTargetRef={sessionPlayerRef}
       blackout={Boolean(gapEntry)}
+      gpsTrack={hasGps ? gpsTrack : undefined}
+      gpsPlaybackTime={displayedPosition}
+      gpsActiveGroup={gapEntry ? null : clipIndex}
     />
     </div>
-    {hasGps && mapVisible && <SessionGpsPlayback type="videos" recordings={clips} entries={timeline.clipEntries}
+    {hasGps && mapVisible && <SessionGpsPlayback track={gpsTrack}
       playbackTime={displayedPosition} activeGroup={gapEntry ? null : clipIndex} onSeek={seekSession} />}
     </div>
   </div>
 }
 
-function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlaybackTime, seekRequest }) {
+function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlaybackTime, seekRequest, gpsTrack }) {
   const audioRef = useRef(null)
   const canvasRef = useRef(null)
   const [peaks, setPeaks] = useState([])
@@ -1164,7 +1200,7 @@ function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlay
       <div className="video-control-row">
         <button type="button" className="playback-control" onClick={toggleAudioPlayback} aria-label={playing ? 'Pause' : 'Play'} title={playing ? 'Pause' : 'Play'}><Icon name={playing ? 'pause' : 'play'} /></button>
         <span>{formatTimelineDuration(currentTime)} / {formatTimelineDuration(duration)}</span>
-        <span className="playback-timestamp"><small>Recorded time</small><strong>{formatPlaybackTimestamp(recording.startTime, currentTime)}</strong></span>
+        <span className="playback-timestamp"><small>Recorded time</small><strong>{formatPlaybackTimestamp(recording.startTime, currentTime)}</strong><PlaybackGpsValue track={gpsTrack} playbackTime={currentTime} /></span>
         <select className="playback-rate" value={playbackRate} onChange={changeAudioPlaybackRate} aria-label="Playback speed" title="Playback speed">
           {[0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4].map(rate => <option value={rate} key={rate}>{rate}x</option>)}
         </select>
@@ -1179,6 +1215,7 @@ function VideoPlaybackModal({ recording, onClose, onRotate }) {
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
   const hasGps = Number(recording.gpsPointCount) > 0
   const [mapVisible, setMapVisible] = useState(true)
+  const gpsTrack = useMediaGpsTrack('videos', recording, hasGps)
   const seekFromMap = useCallback(time => {
     setPlaybackTime(time)
     setSeekRequest(current => ({ time, version: current.version + 1 }))
@@ -1197,10 +1234,11 @@ function VideoPlaybackModal({ recording, onClose, onRotate }) {
           seekVersion={seekRequest.version}
           onPlaybackTime={setPlaybackTime}
           fullscreenTargetRef={hasGps ? fullscreenRef : undefined}
+          gpsTrack={hasGps ? gpsTrack : undefined}
         />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)} | Playback {recording.playbackRotationDegrees || 0} deg</p>
       </div>
-      {hasGps && mapVisible && <MediaGpsPlayback type="videos" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+      {hasGps && mapVisible && <MediaGpsPlayback track={gpsTrack} playbackTime={playbackTime} onSeek={seekFromMap} />}
     </div>
   </div></div>
 }
@@ -1210,6 +1248,7 @@ function AudioPlaybackModal({ recording, onClose }) {
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
   const hasGps = Number(recording.gpsPointCount) > 0
   const [mapVisible, setMapVisible] = useState(true)
+  const gpsTrack = useMediaGpsTrack('audio', recording, hasGps)
   const seekFromMap = useCallback(time => {
     setPlaybackTime(time)
     setSeekRequest(current => ({ time, version: current.version + 1 }))
@@ -1219,10 +1258,10 @@ function AudioPlaybackModal({ recording, onClose }) {
     <div><strong>{recording.originalFilename || recording.filename}</strong><span className="player-actions">{hasGps && <GpsVisibilityButton visible={mapVisible} onToggle={() => setMapVisible(current => !current)} />}<button className="close-player" aria-label="Close player" onClick={onClose}>X</button></span></div>
     <div className="media-playback-grid">
       <div className="media-playback-main">
-        <WaveformAudio key={recording.id} recording={recording} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} />
+        <WaveformAudio key={recording.id} recording={recording} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} gpsTrack={hasGps ? gpsTrack : undefined} />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)}</p>
       </div>
-      {hasGps && mapVisible && <MediaGpsPlayback type="audio" recording={recording} playbackTime={playbackTime} onSeek={seekFromMap} />}
+      {hasGps && mapVisible && <MediaGpsPlayback track={gpsTrack} playbackTime={playbackTime} onSeek={seekFromMap} />}
     </div>
   </div></div>
 }
@@ -1373,6 +1412,7 @@ function AudioSessionPlayback({ session }) {
   const gapEntry = gapEntryIndex == null ? null : timeline.entries[gapEntryIndex]
   const currentRecordingEntry = timeline.recordingEntries[recordingIndex]
   const displayedPosition = scrubPosition ?? sessionPosition
+  const gpsTrack = useSessionGpsTrack('audio', recordings, timeline.recordingEntries, hasGps)
   const displayedRecordingTime = gapEntry ? 0 : Math.max(0, displayedPosition - currentRecordingEntry.start)
   const displayedRecordedTime = gapEntry
     ? formatPlaybackTimestamp(
@@ -1682,14 +1722,14 @@ function AudioSessionPlayback({ session }) {
       <div className="video-control-row">
         <button type="button" className="playback-control" onClick={togglePlayback} aria-label={playing ? 'Pause' : 'Play'} title={playing ? 'Pause' : 'Play'}><Icon name={playing ? 'pause' : 'play'} /></button>
         <span>{formatTimelineDuration(displayedPosition)} / {formatTimelineDuration(timeline.duration)}</span>
-        <span className="playback-timestamp"><small>Recorded time</small><strong>{displayedRecordedTime}</strong></span>
+        <span className="playback-timestamp"><small>Recorded time</small><strong>{displayedRecordedTime}</strong><PlaybackGpsValue track={hasGps ? gpsTrack : undefined} playbackTime={displayedPosition} activeGroup={gapEntry ? null : recordingIndex} /></span>
         <select className="playback-rate" value={playbackRate} onChange={changePlaybackRate} aria-label="Playback speed" title="Playback speed">
           {[0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4].map(rate => <option value={rate} key={rate}>{rate}x</option>)}
         </select>
       </div>
     </div>
     </div>
-    {hasGps && mapVisible && <SessionGpsPlayback type="audio" recordings={recordings} entries={timeline.recordingEntries}
+    {hasGps && mapVisible && <SessionGpsPlayback track={gpsTrack}
       playbackTime={displayedPosition} activeGroup={gapEntry ? null : recordingIndex} onSeek={seekSession} />}
     </div>
     {transcriptOpen && <SessionTranscript recordings={recordings} entries={timeline.recordingEntries} playbackTime={displayedPosition} onSeek={seekSession} />}
