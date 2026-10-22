@@ -255,8 +255,10 @@ app.MapGet("/api/devices/{deviceId}/battery-history", async (
     BatteryHistoryBroker batteryHistory,
     CancellationToken cancellationToken) =>
 {
-    if (!await db.DeviceStatuses.AnyAsync(device => device.DeviceId == deviceId, cancellationToken))
-        return Results.NotFound(new { error = "Device not found." });
+    var device = await db.DeviceStatuses.FindAsync([deviceId], cancellationToken);
+    if (device is null) return Results.NotFound(new { error = "Device not found." });
+    if (device.ClientType == "esp32")
+        return Results.BadRequest(new { error = "This live-only device does not report battery history." });
     var requestedHours = (hours ?? 24) is 8 or 24 or 72 ? hours ?? 24 : 24;
     try
     {
@@ -322,13 +324,16 @@ app.MapPost("/api/devices/{deviceId}/recording", async (
     string deviceId, RemoteRecordingRequest request, DashcamDbContext db,
     DeviceWebSocketHub sockets, RemoteRecordingBroker broker, CancellationToken cancellationToken) =>
 {
-    if (request.Action is not ("start" or "stop" or "configure" or "start_audio" or "stop_audio"))
+    if (request.Action is not ("get_settings" or "start" or "stop" or "configure" or "start_audio" or "stop_audio" or "configure_audio"))
         return Results.BadRequest(new { error = "Choose a video or audio recording command." });
     if (request.Action is "start" or "configure" &&
         (request.Quality is not ("Balanced" or "High") ||
          request.SegmentMinutes is null or < 0 or > 1440 ||
          request.StartAlert is not ("Silent" or "SoundOnly" or "ScreenOnly" or "SoundAndScreen")))
         return Results.BadRequest(new { error = "Choose a video quality, a segment length from 0 to 1440 minutes, and a start alert." });
+    if (request.Action is "start_audio" or "configure_audio" &&
+        request.AudioSegmentMinutes is null or < 0 or > 1440)
+        return Results.BadRequest(new { error = "Choose an audio segment length from 0 to 1440 minutes." });
     var device = await db.DeviceStatuses.FindAsync([deviceId], cancellationToken);
     if (device is null) return Results.NotFound(new { error = "Device not found." });
     if (!device.RemoteControlEnabled)
@@ -363,8 +368,8 @@ app.MapPost("/api/devices/{deviceId}/live", async (
         var socketState = sockets.GetConnectionState(deviceId);
         var online = socketState ?? (DateTime.UtcNow - AsUtc(device.LastSeenAt) <=
             TimeSpan.FromSeconds(DeviceOnlineThresholdSeconds));
-        if (!online) return Results.Conflict(new { error = "Phone is offline." });
-        if (!device.LiveAccessEnabled) return Results.Conflict(new { error = "Live Access is disabled on the phone." });
+        if (!online) return Results.Conflict(new { error = "Device is offline." });
+        if (!device.LiveAccessEnabled) return Results.Conflict(new { error = "Live Access is disabled on the device." });
         if (device.VideoRecordingActive || device.AudioRecordingActive)
             return Results.Conflict(new { error = "Phone is recording." });
         device.LiveError = string.Empty;
@@ -405,6 +410,8 @@ app.MapPost("/api/devices/{deviceId}/live/torch", async (
 {
     var device = await db.DeviceStatuses.FindAsync([deviceId], cancellationToken);
     if (device is null) return Results.NotFound(new { error = "Device not found." });
+    if (device.ClientType == "esp32")
+        return Results.BadRequest(new { error = "This device has no flashlight." });
     if (!device.LiveRequested)
         return Results.Conflict(new { error = "Start live viewing before controlling the flashlight." });
     if (sockets.GetConnectionState(deviceId) != true)
@@ -450,6 +457,8 @@ app.MapPost("/api/devices/{deviceId}/live/camera", async (
 
     var device = await db.DeviceStatuses.FindAsync([deviceId], cancellationToken);
     if (device is null) return Results.NotFound(new { error = "Device not found." });
+    if (device.ClientType == "esp32")
+        return Results.BadRequest(new { error = "This device has a single fixed camera." });
     if (!device.LiveRequested)
         return Results.Conflict(new { error = "Start live viewing before switching cameras." });
     if (sockets.GetConnectionState(deviceId) != true)
@@ -1384,6 +1393,9 @@ app.MapPost("/api/video-exports", async (
     var timezoneOffset = request.WithTimestamp
         ? Math.Clamp(request.TimezoneOffsetMinutes, -14 * 60, 14 * 60)
         : (int?)null;
+    var locationsByVideo = request.WithTimestamp
+        ? await LoadVideoLocationsAsync(db, videos, token)
+        : null;
     var first = AsUtc(videos[0].StartTime);
     var last = AsUtc(videos[^1].EndTime);
     var suffix = request.WithTimestamp ? "_with_time" : string.Empty;
@@ -1410,7 +1422,7 @@ app.MapPost("/api/video-exports", async (
             (_, current) => current with { Status = "processing" });
         try
         {
-            var exportPath = await CreateVideoSessionDownloadAsync(videos, timezoneOffset, CancellationToken.None);
+            var exportPath = await CreateVideoSessionDownloadAsync(videos, timezoneOffset, locationsByVideo, CancellationToken.None);
             videoExportJobs.AddOrUpdate(
                 jobId,
                 job with { Status = "ready", ExportPath = exportPath, CompletedAtUtc = DateTime.UtcNow },
@@ -1512,6 +1524,9 @@ app.MapGet("/api/videos/session/download", async (
         return Results.NotFound(new { error = "One or more selected video files are missing." });
     if (videos.Zip(videos.Skip(1), (older, newer) => VideoGapSeconds(newer, older)).Any(gap => gap > 10))
         return Results.BadRequest(new { error = "The selected videos do not form one continuous session." });
+    var locationsByVideo = withTimestamp == true
+        ? await LoadVideoLocationsAsync(db, videos, token)
+        : null;
 
     context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
     context.Response.Headers.Pragma = "no-cache";
@@ -1524,7 +1539,7 @@ app.MapGet("/api/videos/session/download", async (
         var timestampOffset = withTimestamp == true
             ? Math.Clamp(timezoneOffsetMinutes ?? 0, -14 * 60, 14 * 60)
             : (int?)null;
-        exportPath = await CreateVideoSessionDownloadAsync(videos, timestampOffset, token);
+        exportPath = await CreateVideoSessionDownloadAsync(videos, timestampOffset, locationsByVideo, token);
     }
     finally
     {
@@ -1566,13 +1581,14 @@ app.MapGet("/api/videos/{id:int}/download-with-time", async (
     var video = await db.Videos.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token);
     if (video is null) return Results.NotFound();
     if (!File.Exists(video.FilePath)) return Results.NotFound(new { error = "Video file is missing." });
+    var locationsByVideo = await LoadVideoLocationsAsync(db, new[] { video }, token);
 
     await sessionExportGate.WaitAsync(token);
     string exportPath;
     try
     {
         var timestampOffset = Math.Clamp(timezoneOffsetMinutes ?? 0, -14 * 60, 14 * 60);
-        exportPath = await CreateVideoSessionDownloadAsync(new[] { video }, timestampOffset, token);
+        exportPath = await CreateVideoSessionDownloadAsync(new[] { video }, timestampOffset, locationsByVideo, token);
     }
     finally
     {
@@ -2259,9 +2275,25 @@ static async Task<string> CreateAudioSessionDownloadAsync(
     }
 }
 
+static async Task<Dictionary<int, List<RecordingLocationPoint>>> LoadVideoLocationsAsync(
+    DashcamDbContext db,
+    IReadOnlyList<Video> videos,
+    CancellationToken token)
+{
+    var ids = videos.Select(video => video.Id).ToArray();
+    if (ids.Length == 0) return new Dictionary<int, List<RecordingLocationPoint>>();
+    var points = await db.RecordingLocationPoints.AsNoTracking()
+        .Where(point => point.VideoId.HasValue && ids.Contains(point.VideoId.Value))
+        .OrderBy(point => point.RecordedAt)
+        .ToListAsync(token);
+    return points.GroupBy(point => point.VideoId!.Value)
+        .ToDictionary(group => group.Key, group => group.ToList());
+}
+
 static async Task<string> CreateVideoSessionDownloadAsync(
     IReadOnlyList<Video> videos,
     int? timestampTimezoneOffsetMinutes,
+    IReadOnlyDictionary<int, List<RecordingLocationPoint>>? locationsByVideo,
     CancellationToken token)
 {
     const int outputWidth = 1280;
@@ -2325,7 +2357,8 @@ static async Task<string> CreateVideoSessionDownloadAsync(
         timestampSegments.Add(new TimestampSegment(
             outputOffsetSeconds,
             media[index].DurationSeconds,
-            AsUtc(videos[index].StartTime)));
+            AsUtc(videos[index].StartTime),
+            locationsByVideo?.GetValueOrDefault(videos[index].Id)));
         outputOffsetSeconds += media[index].DurationSeconds;
         segmentCount++;
 
@@ -2339,7 +2372,8 @@ static async Task<string> CreateVideoSessionDownloadAsync(
         timestampSegments.Add(new TimestampSegment(
             outputOffsetSeconds,
             gapSeconds,
-            AsUtc(videos[index].EndTime)));
+            AsUtc(videos[index].EndTime),
+            null));
         outputOffsetSeconds += gapSeconds;
         segmentCount++;
     }
@@ -2355,8 +2389,8 @@ static async Task<string> CreateVideoSessionDownloadAsync(
         var subtitleFilterPath = EscapeFfmpegFilterValue(subtitlePath);
         filters.Add(
             $"[sessionv]subtitles=filename='{subtitleFilterPath}':" +
-            "force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H00FFFFFF," +
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=0,Alignment=2,MarginV=11'[outv]");
+            "force_style='FontName=DejaVu Sans,FontSize=12,PrimaryColour=&H00FFFFFF," +
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=0,Alignment=2,MarginV=8'[outv]");
     }
 
     arguments.AddRange(new[]
@@ -2396,9 +2430,16 @@ static string CreateTimestampSubtitles(
     foreach (var segment in segments)
     {
         var elapsed = 0d;
+        var pointIndex = 0;
+        RecordingLocationPoint? currentPoint = null;
         while (elapsed < segment.DurationSeconds - 0.0005)
         {
             var recordedAtUtc = segment.RecordedStartUtc.AddSeconds(elapsed);
+            while (segment.GpsPoints is { } points && pointIndex < points.Count &&
+                   AsUtc(points[pointIndex].RecordedAt) <= recordedAtUtc)
+            {
+                currentPoint = points[pointIndex++];
+            }
             var fractionalSecond = recordedAtUtc.Ticks % TimeSpan.TicksPerSecond /
                 (double)TimeSpan.TicksPerSecond;
             var untilNextSecond = fractionalSecond < 0.000001 ? 1d : 1d - fractionalSecond;
@@ -2410,7 +2451,24 @@ static string CreateTimestampSubtitles(
                 .Append(FormatSubtitleTime(segment.OutputStartSeconds + elapsed + cueDuration))
                 .AppendLine();
             builder.Append(localRecordedAt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture))
-                .AppendLine().AppendLine();
+                .AppendLine();
+            if (currentPoint is not null &&
+                (recordedAtUtc - AsUtc(currentPoint.RecordedAt)).TotalSeconds <= 120)
+            {
+                builder.Append("GPS: ")
+                    .Append(currentPoint.Latitude.ToString("F6", CultureInfo.InvariantCulture))
+                    .Append(", ")
+                    .Append(currentPoint.Longitude.ToString("F6", CultureInfo.InvariantCulture))
+                    .Append("  |  Speed: ")
+                    .Append(currentPoint.SpeedMetersPerSecond is { } speed
+                        ? $"{(speed * 3.6).ToString("0.0", CultureInfo.InvariantCulture)} km/h"
+                        : "unavailable");
+            }
+            else
+            {
+                builder.Append("GPS: unavailable  |  Speed: unavailable");
+            }
+            builder.AppendLine().AppendLine();
             elapsed += cueDuration;
         }
     }
@@ -2643,6 +2701,7 @@ static async Task EnsureDeviceStatusTableAsync(DashcamDbContext db)
     await db.Database.ExecuteSqlRawAsync(
         "CREATE INDEX IF NOT EXISTS IX_DeviceStatuses_LastSeenAt ON DeviceStatuses (LastSeenAt)");
     await EnsureColumnAsync(db, "DeviceStatuses", "LiveAccessEnabled", "INTEGER NOT NULL DEFAULT 0");
+    await EnsureColumnAsync(db, "DeviceStatuses", "ClientType", "TEXT NOT NULL DEFAULT 'android'");
     await EnsureColumnAsync(db, "DeviceStatuses", "IpAddress", "TEXT NOT NULL DEFAULT ''");
     await EnsureColumnAsync(db, "DeviceStatuses", "LiveRequested", "INTEGER NOT NULL DEFAULT 0");
     await EnsureColumnAsync(db, "DeviceStatuses", "LiveStreaming", "INTEGER NOT NULL DEFAULT 0");
@@ -2650,9 +2709,6 @@ static async Task EnsureDeviceStatusTableAsync(DashcamDbContext db)
     await EnsureColumnAsync(db, "DeviceStatuses", "LastSeenTransport", "TEXT NOT NULL DEFAULT 'http'");
     await EnsureColumnAsync(db, "DeviceStatuses", "RemoteControlEnabled", "INTEGER NOT NULL DEFAULT 0");
     await EnsureColumnAsync(db, "DeviceStatuses", "BackgroundRecordingActive", "INTEGER NOT NULL DEFAULT 0");
-    await EnsureColumnAsync(db, "DeviceStatuses", "BackgroundVideoQuality", "TEXT NOT NULL DEFAULT 'Balanced'");
-    await EnsureColumnAsync(db, "DeviceStatuses", "VideoSegmentMinutes", "INTEGER NOT NULL DEFAULT 5");
-    await EnsureColumnAsync(db, "DeviceStatuses", "StartAlert", "TEXT NOT NULL DEFAULT 'Silent'");
     await EnsureColumnAsync(db, "DeviceStatuses", "PowerAutoBackgroundEnabled", "INTEGER NOT NULL DEFAULT 0");
 }
 
@@ -3063,6 +3119,7 @@ static object ToDeviceResponse(DeviceStatus device, DateTime now, bool? socketCo
     {
     device.DeviceId,
     device.DeviceName,
+    device.ClientType,
     device.Manufacturer,
     device.Model,
     device.AndroidVersion,
@@ -3077,9 +3134,6 @@ static object ToDeviceResponse(DeviceStatus device, DateTime now, bool? socketCo
     device.LiveAccessEnabled,
     device.RemoteControlEnabled,
     device.BackgroundRecordingActive,
-    device.BackgroundVideoQuality,
-    device.VideoSegmentMinutes,
-    device.StartAlert,
     device.PowerAutoBackgroundEnabled,
     device.LiveRequested,
     device.LiveStreaming,
@@ -3235,11 +3289,10 @@ static async Task<DeviceStatus> ApplyDeviceHeartbeatAsync(
         device.LastSeenAt = now;
     }
 
-    device.RemoteControlEnabled = request.RemoteControlEnabled;
+    device.ClientType = string.Equals(request.ClientType, "esp32", StringComparison.OrdinalIgnoreCase)
+        ? "esp32" : "android";
+    device.RemoteControlEnabled = device.ClientType != "esp32" && request.RemoteControlEnabled;
     device.BackgroundRecordingActive = request.BackgroundRecordingActive;
-    device.BackgroundVideoQuality = request.BackgroundVideoQuality == "High" ? "High" : "Balanced";
-    device.VideoSegmentMinutes = Math.Clamp(request.VideoSegmentMinutes, 0, 1440);
-    device.StartAlert = request.StartAlert is "SoundOnly" or "ScreenOnly" or "SoundAndScreen" ? request.StartAlert : "Silent";
     device.PowerAutoBackgroundEnabled = request.PowerAutoBackgroundEnabled;
 
     if (!request.LiveAccessEnabled || request.VideoRecordingActive || request.AudioRecordingActive)
@@ -3507,7 +3560,8 @@ public sealed record AudioTranscriptionWorkerResponse(
 public sealed record TimestampSegment(
     double OutputStartSeconds,
     double DurationSeconds,
-    DateTime RecordedStartUtc);
+    DateTime RecordedStartUtc,
+    IReadOnlyList<RecordingLocationPoint>? GpsPoints);
 public sealed record VideoCleanupResult(
     int RemovedCount,
     long RemovedBytes,
@@ -3532,10 +3586,8 @@ public sealed record DeviceHeartbeatRequest(
     string? LiveError,
     bool RemoteControlEnabled = false,
     bool BackgroundRecordingActive = false,
-    string? BackgroundVideoQuality = "Balanced",
-    int VideoSegmentMinutes = 5,
-    string? StartAlert = "Silent",
-    bool PowerAutoBackgroundEnabled = false);
+    bool PowerAutoBackgroundEnabled = false,
+    string? ClientType = null);
 public sealed record LiveRequest(bool Enabled);
 public sealed record LiveTorchRequest(bool Enabled);
 public sealed record LiveCameraRequest(string? Facing);

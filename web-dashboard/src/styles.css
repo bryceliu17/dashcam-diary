@@ -4,6 +4,7 @@
 .remote-recording-body { padding: 16px; border-top: 1px solid #303841; }
 .remote-recording-body p { padding: 0; line-height: 1.6; }
 .remote-recording-body .remote-recording-state { color: #dfffc2; }
+.remote-settings-refresh { min-height: 36px; padding: 7px 12px; border: 1px solid #3a444e; background: #171d23; color: #dfffc2; cursor: pointer; }
 .remote-recording-body fieldset { margin: 12px 0; padding: 0; border: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .remote-recording-body fieldset label { display: flex; min-width: 0; flex-direction: column; gap: 7px; color: #aab3bc; font-size: 12px; }
 .remote-recording-body select,.remote-recording-body input { width: 100%; min-height: 44px; border: 1px solid #3a444e; background: #11161b; color: #e9edf2; color-scheme: dark; padding: 8px; }

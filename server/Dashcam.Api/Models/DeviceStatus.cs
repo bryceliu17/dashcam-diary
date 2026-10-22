@@ -4,6 +4,7 @@ public sealed class DeviceStatus
 {
     public required string DeviceId { get; set; }
     public required string DeviceName { get; set; }
+    public string ClientType { get; set; } = "android";
     public required string Manufacturer { get; set; }
     public required string Model { get; set; }
     public required string AndroidVersion { get; set; }
@@ -18,9 +19,6 @@ public sealed class DeviceStatus
     public bool LiveAccessEnabled { get; set; }
     public bool RemoteControlEnabled { get; set; }
     public bool BackgroundRecordingActive { get; set; }
-    public string BackgroundVideoQuality { get; set; } = "Balanced";
-    public int VideoSegmentMinutes { get; set; } = 5;
-    public string StartAlert { get; set; } = "Silent";
     public bool PowerAutoBackgroundEnabled { get; set; }
     public bool LiveRequested { get; set; }
     public bool LiveStreaming { get; set; }

@@ -363,7 +363,9 @@ class MainActivity : ComponentActivity() {
         liveStreaming = LiveAccessSettings.isStreaming(this)
         liveError = LiveAccessSettings.error(this)
         val prefs = getSharedPreferences(UploadWorker.PREFS, MODE_PRIVATE)
+        val requestInitialGpsPermission = applyFirstOpenDefaults()
         buildUi()
+        if (requestInitialGpsPermission) requestLocationPermissionIfNeeded(GpsRecordingMode.AudioDiary)
         if (liveAccessEnabled || RemoteRecordingControl.isEnabled(this)) {
             LiveAccessService.refreshConnection(this)
         }
@@ -441,6 +443,43 @@ class MainActivity : ComponentActivity() {
         locationTracker.cancel()
         cameraExecutor.shutdown()
         super.onDestroy()
+    }
+
+    private fun applyFirstOpenDefaults(): Boolean {
+        val prefs = getSharedPreferences(UploadWorker.PREFS, MODE_PRIVATE)
+        val marker = "first_open_defaults_v1_applied"
+        if (prefs.getBoolean(marker, false)) return false
+
+        // An upgrade must keep the values (including earlier implicit defaults) already in use.
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        val freshInstall = packageInfo.firstInstallTime == packageInfo.lastUpdateTime
+        if (freshInstall) {
+            if (!prefs.contains("video_segment_duration_minutes")) {
+                VideoSegmentSettings.setDurationMinutes(this, VideoSegmentSettings.DEFAULT_DURATION_MINUTES)
+            }
+            if (!prefs.contains("audio_segment_duration_minutes")) {
+                AudioSegmentSettings.setDurationMinutes(this, AudioSegmentSettings.DEFAULT_DURATION_MINUTES)
+            }
+            if (!prefs.contains("recording_start_alert_mode")) {
+                RecordingStartAlertSettings.setMode(this, RecordingStartAlertMode.SoundAndScreen)
+            }
+            if (!prefs.contains("video_gps_recording_mode")) {
+                GpsRecordingSettings.setVideoMode(this, GpsRecordingMode.AudioDiary)
+            }
+            if (!prefs.contains("audio_gps_recording_mode")) {
+                GpsRecordingSettings.setAudioMode(this, GpsRecordingMode.AudioDiary)
+            }
+            if (!prefs.contains("background_video_quality")) {
+                BackgroundVideoQualitySettings.setQuality(this, BackgroundVideoQuality.High)
+            }
+            if (!prefs.contains(UploadWorker.KEY_AUTO_UPLOAD_ENABLED)) {
+                prefs.edit().putBoolean(UploadWorker.KEY_AUTO_UPLOAD_ENABLED, true).apply()
+            }
+        }
+        prefs.edit().putBoolean(marker, true).apply()
+        return freshInstall &&
+            (GpsRecordingSettings.videoMode(this) != GpsRecordingMode.Off ||
+                GpsRecordingSettings.audioMode(this) != GpsRecordingMode.Off)
     }
 
     private fun buildUi() {

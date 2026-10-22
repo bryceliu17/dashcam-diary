@@ -30,3 +30,7 @@ android-app-legacy/build/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# ESP32 firmware and local Wi-Fi credentials
+esp32-client/.pio/
+esp32-client/include/dashcam_config.h

@@ -37,9 +37,6 @@ data class DeviceHeartbeat(
     val liveError: String,
     val remoteControlEnabled: Boolean = false,
     val backgroundRecordingActive: Boolean = false,
-    val backgroundVideoQuality: String = "Balanced",
-    val videoSegmentMinutes: Int = 5,
-    val startAlert: String = "Silent",
     val powerAutoBackgroundEnabled: Boolean = false
 )
 
@@ -71,9 +68,6 @@ fun DeviceHeartbeat.toJson(): JSONObject = JSONObject()
     .put("liveError", liveError)
     .put("remoteControlEnabled", remoteControlEnabled)
     .put("backgroundRecordingActive", backgroundRecordingActive)
-    .put("backgroundVideoQuality", backgroundVideoQuality)
-    .put("videoSegmentMinutes", videoSegmentMinutes)
-    .put("startAlert", startAlert)
     .put("powerAutoBackgroundEnabled", powerAutoBackgroundEnabled)
 
 class ServerClient(private val baseUrl: String) {

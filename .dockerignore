@@ -11,4 +11,5 @@ server/Dashcam.Api/videos
 *.db-shm
 *.db-wal
 *.log
+esp32-client
 

@@ -1737,6 +1737,7 @@ function AudioSessionPlayback({ session }) {
 }
 
 function LiveViewer({ device, onClose, onTorch, onCamera }) {
+  const espCamera = device.clientType === 'esp32'
   const [frameUrl, setFrameUrl] = useState('')
   const [waiting, setWaiting] = useState(true)
   const [rotation, setRotation] = useState(0)
@@ -1907,7 +1908,7 @@ function LiveViewer({ device, onClose, onTorch, onCamera }) {
           >
             <Icon name={fullscreen ? 'fullscreenExit' : 'fullscreen'} />
           </button>
-          <span className="live-camera-switch" aria-label="Live camera selection">
+          {!espCamera && <span className="live-camera-switch" aria-label="Live camera selection">
             <button
               type="button"
               className={`torch-control${cameraFacing === 'back' ? ' active' : ''}`}
@@ -1922,7 +1923,7 @@ function LiveViewer({ device, onClose, onTorch, onCamera }) {
               disabled={!device.liveStreaming || cameraBusy}
               onClick={() => switchCamera('front')}
             >{cameraBusy ? 'Switching...' : 'Front'}</button>
-          </span>
+          </span>}
           <button
             type="button"
             className="rotate-control"
@@ -1932,7 +1933,7 @@ function LiveViewer({ device, onClose, onTorch, onCamera }) {
             <Icon name="rotate" />
             <span>Rotate 90 deg</span>
           </button>
-          <button
+          {!espCamera && <button
             type="button"
             className={`torch-control${torchEnabled ? ' active' : ''}`}
             title={torchEnabled ? 'Turn phone flashlight off' : 'Turn phone flashlight on'}
@@ -1941,7 +1942,7 @@ function LiveViewer({ device, onClose, onTorch, onCamera }) {
           >
             <Icon name="flashlight" />
             <span>{torchBusy ? 'Light...' : torchEnabled ? 'Light Off' : 'Light On'}</span>
-          </button>
+          </button>}
           <button className="close-player" aria-label="Stop and close live view" title="Stop live view" onClick={onClose}>X</button>
         </span>
       </div>
@@ -1957,9 +1958,9 @@ function LiveViewer({ device, onClose, onTorch, onCamera }) {
             transform: `translate(-50%, -50%) rotate(${rotation}deg)`,
           }}
         />}
-        {waiting && <div className="live-waiting"><div className="spinner" /><span>Waiting for phone camera...</span></div>}
+        {waiting && <div className="live-waiting"><div className="spinner" /><span>Waiting for camera...</span></div>}
       </div>
-      <p>{cameraError || torchError || device.liveError || (device.liveStreaming ? `Live ${cameraFacing} camera connected - view rotation ${rotation} deg${torchEnabled ? ' - flashlight on' : ''}` : 'Starting live camera')}</p>
+      <p>{cameraError || torchError || device.liveError || (device.liveStreaming ? `Live ${espCamera ? 'ESP32' : cameraFacing} camera connected - view rotation ${rotation} deg${torchEnabled ? ' - flashlight on' : ''}` : 'Starting live camera')}</p>
     </div>
   </div>
 }
@@ -2155,41 +2156,107 @@ function BatteryHistoryModal({ state, onRange, onClose }) {
 }
 
 function RemoteRecordingPanel({ device, onClose, onUpdated }) {
-  const [quality, setQuality] = useState(device.backgroundVideoQuality || 'Balanced')
-  const [minutes, setMinutes] = useState(String(device.videoSegmentMinutes ?? 5))
-  const [alert, setAlert] = useState(device.startAlert || 'Silent')
+  const [quality, setQuality] = useState('')
+  const [minutes, setMinutes] = useState('')
+  const [audioMinutes, setAudioMinutes] = useState('')
+  const [videoCustom, setVideoCustom] = useState(false)
+  const [audioCustom, setAudioCustom] = useState(false)
+  const [alert, setAlert] = useState('')
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
   const [failed, setFailed] = useState(false)
-  const [dirty, setDirty] = useState(false)
-  const form = useRef(null)
+  const [videoDirty, setVideoDirty] = useState(false)
+  const [audioDirty, setAudioDirty] = useState(false)
+  const [settingsReady, setSettingsReady] = useState(false)
+  const [settingsLoading, setSettingsLoading] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
+  const settingsRequestId = useRef(0)
+  const videoMinutesInput = useRef(null)
+  const audioMinutesInput = useRef(null)
   const connected = device.online && device.onlineSource === 'websocket' && device.remoteControlEnabled
   const recording = device.videoRecordingActive || device.audioRecordingActive
 
-  useEffect(() => {
-    if (!dirty && !busy) {
-      setQuality(device.backgroundVideoQuality || 'Balanced')
-      setMinutes(String(device.videoSegmentMinutes ?? 5))
-      setAlert(device.startAlert || 'Silent')
-    }
-  }, [device.backgroundVideoQuality, device.videoSegmentMinutes, device.startAlert, dirty, busy])
+  const validSettings = result =>
+    ['Balanced', 'High'].includes(result.quality) &&
+    Number.isInteger(result.segmentMinutes) && result.segmentMinutes >= 0 && result.segmentMinutes <= 1440 &&
+    Number.isInteger(result.audioSegmentMinutes) && result.audioSegmentMinutes >= 0 && result.audioSegmentMinutes <= 1440 &&
+    ['Silent', 'SoundOnly', 'ScreenOnly', 'SoundAndScreen'].includes(result.startAlert)
+  const validMinutes = value => value !== '' && Number.isInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 1440
 
-  const send = async action => {
-    if (busy || !connected) return
-    const videoAction = action === 'start' || action === 'configure'
-    if (videoAction && !form.current.reportValidity()) return
-    setBusy(action)
-    setFailed(false)
-    setMessage(action === 'stop' ? 'Saving the current video segment and stopping…' : action === 'stop_audio' ? 'Saving the current audio segment and stopping…' : action === 'start' ? 'Waiting for the phone to start video recording…' : action === 'start_audio' ? 'Waiting for the phone to start audio recording…' : 'Saving video settings on the phone…')
+  const loadSettings = useCallback(async () => {
+    if (!connected) return
+    const requestId = ++settingsRequestId.current
+    setSettingsReady(false)
+    setSettingsLoading(true)
+    setSettingsError('')
     try {
       const result = await api(`/api/devices/${encodeURIComponent(device.deviceId)}/recording`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, quality, segmentMinutes: Number(minutes), startAlert: alert }),
+        body: JSON.stringify({ action: 'get_settings' }),
+      })
+      if (requestId !== settingsRequestId.current) return
+      if (!result.success) throw new Error(result.error || 'The phone could not provide its settings.')
+      if (!validSettings(result)) throw new Error('Update the phone app before controlling its recording settings.')
+      setQuality(result.quality)
+      setMinutes(String(result.segmentMinutes))
+      setAudioMinutes(String(result.audioSegmentMinutes))
+      setVideoCustom(![0, 1, 3, 5, 10, 15, 30].includes(result.segmentMinutes))
+      setAudioCustom(![0, 5, 10, 15, 30, 60].includes(result.audioSegmentMinutes))
+      setAlert(result.startAlert)
+      setVideoDirty(false)
+      setAudioDirty(false)
+      setSettingsReady(true)
+    } catch (error) {
+      if (requestId === settingsRequestId.current) setSettingsError(error.message)
+    } finally {
+      if (requestId === settingsRequestId.current) setSettingsLoading(false)
+    }
+  }, [connected, device.deviceId])
+
+  useEffect(() => {
+    if (connected) loadSettings()
+    else {
+      settingsRequestId.current += 1
+      setSettingsReady(false)
+      setSettingsLoading(false)
+      setSettingsError('')
+    }
+    return () => { settingsRequestId.current += 1 }
+  }, [connected, loadSettings])
+
+  const send = async action => {
+    if (busy || !connected || (!settingsReady && action !== 'stop' && action !== 'stop_audio')) return
+    const videoAction = action === 'start' || action === 'configure'
+    const audioAction = action === 'start_audio' || action === 'configure_audio'
+    if (videoAction && !validMinutes(minutes)) {
+      videoMinutesInput.current?.reportValidity()
+      return
+    }
+    if (audioAction && !validMinutes(audioMinutes)) {
+      audioMinutesInput.current?.reportValidity()
+      return
+    }
+    setBusy(action)
+    setFailed(false)
+    setMessage(action === 'stop' ? 'Saving the current video segment and stopping…' : action === 'stop_audio' ? 'Saving the current audio segment and stopping…' : action === 'start' ? 'Waiting for the phone to start video recording…' : action === 'start_audio' ? 'Waiting for the phone to start audio recording…' : action === 'configure_audio' ? 'Saving audio settings on the phone…' : 'Saving video settings on the phone…')
+    try {
+      const result = await api(`/api/devices/${encodeURIComponent(device.deviceId)}/recording`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, quality, segmentMinutes: Number(minutes), audioSegmentMinutes: Number(audioMinutes), startAlert: alert }),
       })
       if (!result.success) throw new Error(result.error || 'The phone could not complete this command.')
       onUpdated(device.deviceId, result)
-      setDirty(false)
-      setMessage(action === 'stop' || action === 'stop_audio' ? 'Recording stopped. The current segment has been saved.' : action === 'start' || action === 'start_audio' ? 'The phone confirmed recording has started.' : 'Video settings saved on the phone.')
+      if (settingsReady && validSettings(result)) {
+        if (!videoDirty || videoAction) {
+          setQuality(result.quality)
+          setMinutes(String(result.segmentMinutes))
+          setAlert(result.startAlert)
+        }
+        if (!audioDirty || audioAction) setAudioMinutes(String(result.audioSegmentMinutes))
+      }
+      if (videoAction) setVideoDirty(false)
+      if (audioAction) setAudioDirty(false)
+      setMessage(action === 'stop' || action === 'stop_audio' ? 'Recording stopped. The current segment has been saved.' : action === 'start' || action === 'start_audio' ? 'The phone confirmed recording has started.' : action === 'configure_audio' ? 'Audio settings saved on the phone.' : 'Video settings saved on the phone.')
     } catch (error) { setMessage(error.message); setFailed(true) }
     finally { setBusy('') }
   }
@@ -2201,27 +2268,39 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
         <p className="remote-recording-state">{device.backgroundRecordingActive ? 'Background video recording' : device.videoRecordingActive ? 'Foreground video recording' : device.audioRecordingActive ? 'Audio recording' : 'Idle'} · {connected ? 'Control connected' : 'Control unavailable'}</p>
         {!device.remoteControlEnabled && <p>Turn on “Allow server control” in the phone app. Only the phone can grant this permission.</p>}
         {device.remoteControlEnabled && !connected && <p>The phone must reconnect before commands can be sent. Offline commands are not queued.</p>}
+        {connected && <button type="button" className="remote-settings-refresh" disabled={settingsLoading || Boolean(busy)} onClick={() => {
+          if ((videoDirty || audioDirty) && !window.confirm('Discard unsaved changes and read settings from the phone again?')) return
+          loadSettings()
+        }}>Refresh phone settings</button>}
+        {connected && settingsLoading && <p role="status">Reading current settings from the phone…</p>}
+        {connected && settingsError && <p className="remote-command-error" role="alert">{settingsError}</p>}
         {device.powerAutoBackgroundEnabled && !device.isCharging && <p className="remote-power-warning">Power Auto mode is on, but this phone is not charging. A remotely started video will stop after the current segment.</p>}
-        <form ref={form} onSubmit={event => { event.preventDefault(); send('start') }}>
-          <fieldset disabled={!connected || Boolean(busy) || recording}>
-            <label>Background video quality<select value={quality} onChange={event => { setQuality(event.target.value); setDirty(true) }}>
+        <form onSubmit={event => event.preventDefault()}>
+          {settingsReady && <fieldset disabled={!connected || Boolean(busy) || recording}>
+            <label>Background video quality<select value={quality} onChange={event => { setQuality(event.target.value); setVideoDirty(true) }}>
               <option value="Balanced">Balanced · 720p</option><option value="High">High · 1080p (when supported)</option>
             </select></label>
-            <label>Video segment length<select value={['0', '1', '3', '5', '10', '15', '30'].includes(minutes) ? minutes : 'custom'} onChange={event => { setMinutes(event.target.value === 'custom' ? '' : event.target.value); setDirty(true) }}>
+            <label>Video segment length<select value={videoCustom ? 'custom' : minutes} onChange={event => { setVideoCustom(event.target.value === 'custom'); setMinutes(event.target.value === 'custom' ? '' : event.target.value); setVideoDirty(true) }}>
               {[1, 3, 5, 10, 15, 30].map(value => <option key={value} value={value}>{value} minutes</option>)}
               <option value="0">Unlimited</option><option value="custom">Custom</option>
             </select></label>
-            <label>Minutes (0 = unlimited)<input type="number" inputMode="numeric" min="0" max="1440" step="1" required value={minutes} onChange={event => { setMinutes(event.target.value); setDirty(true) }} /></label>
-            <label>Start alert<select value={alert} onChange={event => { setAlert(event.target.value); setDirty(true) }}>
+            {videoCustom && <label>Custom video minutes<input ref={videoMinutesInput} type="number" inputMode="numeric" min="0" max="1440" step="1" required value={minutes} onChange={event => { setMinutes(event.target.value); setVideoDirty(true) }} /></label>}
+            <label>Start alert<select value={alert} onChange={event => { setAlert(event.target.value); setVideoDirty(true) }}>
               <option value="Silent">Silent</option><option value="SoundOnly">Sound only</option><option value="ScreenOnly">Screen only</option><option value="SoundAndScreen">Sound + screen</option>
             </select></label>
-          </fieldset>
-          <p>These settings apply to background video. Audio uses its existing phone-side segment and alert settings.</p>
+            <label>Audio segment length<select value={audioCustom ? 'custom' : audioMinutes} onChange={event => { setAudioCustom(event.target.value === 'custom'); setAudioMinutes(event.target.value === 'custom' ? '' : event.target.value); setAudioDirty(true) }}>
+              {[5, 10, 15, 30, 60].map(value => <option key={value} value={value}>{value} minutes</option>)}
+              <option value="0">Unlimited</option><option value="custom">Custom</option>
+            </select></label>
+            {audioCustom && <label>Custom audio minutes<input ref={audioMinutesInput} type="number" inputMode="numeric" min="0" max="1440" step="1" required value={audioMinutes} onChange={event => { setAudioMinutes(event.target.value); setAudioDirty(true) }} /></label>}
+          </fieldset>}
+          {settingsReady && <p>Video and audio lengths are saved separately on the phone. Start alert is shared by both; “Save video + alert” saves its selection.</p>}
           <div className="remote-recording-actions">
-            <button type="button" disabled={!connected || Boolean(busy) || recording} onClick={() => send('configure')}>Save settings</button>
-            <button type="submit" disabled={!connected || Boolean(busy) || recording || device.liveStreaming || device.liveRequested}>Start video</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording} onClick={() => send('configure')}>Save video + alert</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording} onClick={() => send('configure_audio')}>Save audio length</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested} onClick={() => send('start')}>Start video</button>
             <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.backgroundRecordingActive} onClick={() => send('stop')}>Stop video & save</button>
-            <button type="button" disabled={!connected || Boolean(busy) || recording || device.liveStreaming || device.liveRequested} onClick={() => send('start_audio')}>Start audio</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested} onClick={() => send('start_audio')}>Start audio</button>
             <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.audioRecordingActive} onClick={() => send('stop_audio')}>Stop audio & save</button>
           </div>
           {(device.liveStreaming || device.liveRequested) && <p>Close live camera before starting video recording.</p>}
@@ -3152,7 +3231,7 @@ export default function App() {
 
       <section className="devices">
         <div className="section-head">
-          <div><p className="eyebrow">CONNECTED DEVICES</p><h2>Dashcam Diary phones</h2></div>
+          <div><p className="eyebrow">CONNECTED DEVICES</p><h2>Dashcam Diary devices</h2></div>
           <span className="device-count">{devices.filter(device => device.online).length} online / {devices.length} known</span>
         </div>
         <div className="device-table-wrap">
@@ -3163,12 +3242,14 @@ export default function App() {
               <td><span className={`device-status ${device.online ? 'online' : 'offline'}`}><i />{device.online ? `Online (${device.onlineSource === 'websocket' ? 'WebSocket' : 'HTTP'})` : 'Offline'}</span></td>
               <td><code className="device-ip">{device.ipAddress || 'Unavailable'}</code></td>
               <td>
-                <div className="battery-value"><span>{device.batteryLevel}%</span><div><i style={{ width: `${device.batteryLevel}%` }} /></div></div>
-                <button className="battery-history-button" disabled={!device.online} onClick={() => loadBatteryHistory(device)}>Temperature history</button>
+                {device.clientType === 'esp32' ? <span>Not measured</span> : <>
+                  <div className="battery-value"><span>{device.batteryLevel}%</span><div><i style={{ width: `${device.batteryLevel}%` }} /></div></div>
+                  <button className="battery-history-button" disabled={!device.online} onClick={() => loadBatteryHistory(device)}>Temperature history</button>
+                </>}
               </td>
-              <td><span>{device.isCharging ? `${device.chargingSource} charging` : 'On battery'}</span><small className={device.powerSaveMode ? 'power-save active' : 'power-save'}>{device.powerSaveMode ? 'Power saving' : 'Normal power'}</small></td>
+              <td>{device.clientType === 'esp32' ? <span>Not measured</span> : <><span>{device.isCharging ? `${device.chargingSource} charging` : 'On battery'}</span><small className={device.powerSaveMode ? 'power-save active' : 'power-save'}>{device.powerSaveMode ? 'Power saving' : 'Normal power'}</small></>}</td>
               <td>{device.liveStreaming ? 'Live streaming' : device.videoRecordingActive ? 'Video recording' : device.audioRecordingActive ? 'Audio recording' : 'Idle'}</td>
-              <td><span>Android {device.androidVersion}</span><small className="software-version">App {device.appVersion}</small></td>
+              <td><span>{device.clientType === 'esp32' ? 'ESP32 · Live camera' : `Android ${device.androidVersion}`}</span><small className="software-version">{device.clientType === 'esp32' ? 'Firmware' : 'App'} {device.appVersion}</small></td>
               <td>{formatDate(device.lastSeenAt)}</td>
               <td><div className="device-remote-actions"><button
                 className={`device-live-button ${device.liveRequested ? 'stop' : ''}`}
@@ -3176,12 +3257,14 @@ export default function App() {
                 title={!device.liveAccessEnabled ? 'Enable Live Access on the phone' : device.liveRequested ? 'Stop live view' : 'Start live view'}
                 onClick={() => device.liveRequested ? stopLive(device.deviceId) : startLive(device)}
               ><Icon name={device.liveRequested ? 'stop' : 'camera'} />{device.liveRequested ? 'Stop' : 'View'}</button>
-                <button type="button" className="device-live-button remote-open-button" onClick={() => setRemoteDeviceId(device.deviceId)}>Control</button>
-                <small className="software-version">Control {device.remoteControlEnabled ? 'allowed' : 'off'}</small>
+                {device.clientType !== 'esp32' && <>
+                  <button type="button" className="device-live-button remote-open-button" onClick={() => setRemoteDeviceId(device.deviceId)}>Control</button>
+                  <small className="software-version">Control {device.remoteControlEnabled ? 'allowed' : 'off'}</small>
+                </>}
               </div></td>
             </tr>)}</tbody>
           </table>
-          {!loading && devices.length === 0 && <div className="device-empty">No phones have reported to this server yet.</div>}
+          {!loading && devices.length === 0 && <div className="device-empty">No devices have reported to this server yet.</div>}
         </div>
       </section>
 
@@ -3351,8 +3434,6 @@ export default function App() {
       onUpdated={(id, result) => setDevices(current => current.map(device => device.deviceId === id ? {
         ...device, backgroundRecordingActive: result.backgroundRecordingActive,
         videoRecordingActive: result.backgroundRecordingActive, audioRecordingActive: result.audioRecordingActive,
-        backgroundVideoQuality: result.quality,
-        videoSegmentMinutes: result.segmentMinutes, startAlert: result.startAlert,
       } : device))}
     />}
     {selected && <VideoPlaybackModal recording={selected} onClose={() => setSelected(null)} onRotate={rotatePlayback} />}

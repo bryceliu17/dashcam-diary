@@ -326,6 +326,7 @@ class BackgroundRecordingService : Service() {
 
     private fun createLegacyRecorder(file: File, camera: Camera): MediaRecorder {
         val profile = selectedCamcorderProfile()
+        val focusMode = configureLegacyFocus(camera)
         legacySurfaceTexture?.release()
         legacySurface?.release()
         legacySurfaceTexture = SurfaceTexture(0).apply {
@@ -336,7 +337,13 @@ class BackgroundRecordingService : Service() {
         try {
             camera.setPreviewTexture(legacySurfaceTexture)
             camera.startPreview()
-        } catch (_: Exception) {
+            if (focusMode == Camera.Parameters.FOCUS_MODE_AUTO) {
+                camera.autoFocus { focused, _ ->
+                    Log.i(TAG, "Legacy background autofocus completed: focused=$focused")
+                }
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Legacy background preview or autofocus failed", error)
         }
         camera.unlock()
 
@@ -363,6 +370,35 @@ class BackgroundRecordingService : Service() {
             setVideoFrameRate(profile.videoFrameRate)
             setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
             setPreviewDisplay(legacySurface)
+        }
+    }
+
+    private fun configureLegacyFocus(camera: Camera): String? {
+        return try {
+            val parameters = camera.parameters
+            val supportedModes = parameters.supportedFocusModes.orEmpty()
+            val defaultMode = parameters.focusMode
+            val selectedMode = when {
+                Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO in supportedModes ->
+                    Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
+                Camera.Parameters.FOCUS_MODE_AUTO in supportedModes ->
+                    Camera.Parameters.FOCUS_MODE_AUTO
+                else -> defaultMode
+            }
+            if (selectedMode != defaultMode) {
+                parameters.focusMode = selectedMode
+                camera.parameters = parameters
+            }
+            val activeMode = camera.parameters.focusMode
+            Log.i(
+                TAG,
+                "Legacy background focus: supported=$supportedModes, default=$defaultMode, " +
+                    "selected=$selectedMode, active=$activeMode"
+            )
+            activeMode
+        } catch (error: Exception) {
+            Log.w(TAG, "Unable to configure legacy background focus", error)
+            null
         }
     }
 

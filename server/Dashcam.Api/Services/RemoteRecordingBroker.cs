@@ -22,7 +22,8 @@ public sealed class RemoteRecordingBroker
                 type = "recording_request", requestId = item.Id,
                 expiresAt = DateTimeOffset.UtcNow.AddSeconds(30).ToUnixTimeMilliseconds(),
                 action = request.Action, quality = request.Quality,
-                segmentMinutes = request.SegmentMinutes, startAlert = request.StartAlert
+                segmentMinutes = request.SegmentMinutes, audioSegmentMinutes = request.AudioSegmentMinutes,
+                startAlert = request.StartAlert
             }, cancellationToken))
                 throw new InvalidOperationException("The phone is disconnected. Reconnect before trying again.");
             return await item.Completion.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
@@ -47,7 +48,8 @@ public sealed class RemoteRecordingBroker
     }
 }
 
-public sealed record RemoteRecordingRequest(string Action, string? Quality, int? SegmentMinutes, string? StartAlert);
+public sealed record RemoteRecordingRequest(string Action, string? Quality, int? SegmentMinutes, string? StartAlert,
+    int? AudioSegmentMinutes);
 public sealed record RemoteRecordingResponse(string RequestId, bool Success, string? Error,
     bool BackgroundRecordingActive, string? Quality, int SegmentMinutes, string? StartAlert,
-    bool AudioRecordingActive);
+    bool AudioRecordingActive, int? AudioSegmentMinutes);

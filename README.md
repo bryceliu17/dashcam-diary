@@ -18,6 +18,8 @@ Both Android clients are maintained together on `main`. The old `android-5-compa
 
 ### Architecture
 
+An optional [ESP32-S3 Sense live-only client](esp32-client/README.md) can also join the device list. It streams JPEG frames on demand through the same server and dashboard; it does not record media or use the Android clients.
+
 ```text
 Android phone
   MP4 video and M4A audio segments
@@ -260,6 +262,8 @@ Its APK is written to `android-app-legacy\app\build\outputs\apk\debug\app-debug.
 两个 Android 客户端现在都在 `main` 中维护。旧 `android-5-compatible` 分支只作为历史备份保留，不再用于开发或部署。
 
 ### 项目架构
+
+可选的 [ESP32-S3 Sense 纯直播客户端](esp32-client/README.md) 也可以接入设备列表，按需通过现有服务端和网页转发 JPEG 画面。此版本不录制文件，独立于两个 Android 客户端。
 
 ```text
 Android 手机

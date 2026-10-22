@@ -14,9 +14,6 @@ import com.example.dashcam.battery.BatteryHistoryPayload
 import com.example.dashcam.live.LiveAccessSettings
 import com.example.dashcam.recording.PowerRecordingSettings
 import com.example.dashcam.recording.RemoteRecordingControl
-import com.example.dashcam.recording.BackgroundVideoQualitySettings
-import com.example.dashcam.recording.VideoSegmentSettings
-import com.example.dashcam.recording.RecordingStartAlertSettings
 import com.example.dashcam.upload.UploadWorker
 import com.example.dashcam.upload.UploadPolicySettings
 import kotlinx.coroutines.CoroutineScope
@@ -174,9 +171,6 @@ object DeviceStatusReporter {
             liveError = LiveAccessSettings.error(context),
             remoteControlEnabled = RemoteRecordingControl.isEnabled(context),
             backgroundRecordingActive = PowerRecordingSettings.isBackgroundRecordingActive(context),
-            backgroundVideoQuality = BackgroundVideoQualitySettings.quality(context).name,
-            videoSegmentMinutes = VideoSegmentSettings.durationMinutes(context),
-            startAlert = RecordingStartAlertSettings.mode(context).name,
             powerAutoBackgroundEnabled = PowerRecordingSettings.isPowerAutoBackgroundEnabled(context)
         )
     }
