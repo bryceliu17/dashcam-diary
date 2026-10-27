@@ -32,6 +32,12 @@ class RotatableVideoPlayer @JvmOverloads constructor(
         setTextColor(0xfff3f4f6.toInt())
     }
     private val seekBar = SeekBar(context)
+    private val recordedTimeView = TextView(context).apply {
+        text = "Recorded time: --"
+        textSize = 13f
+        setTextColor(0xfff3f4f6.toInt())
+        setPadding(dp(12), dp(4), dp(12), dp(2))
+    }
     private val rotateButton = ImageButton(context).apply {
         setImageResource(R.drawable.ic_rotate_clockwise)
         contentDescription = "Rotate playback 90 degrees clockwise"
@@ -63,6 +69,8 @@ class RotatableVideoPlayer @JvmOverloads constructor(
     private var fullscreenListener: ((Boolean) -> Unit)? = null
     private var rotateListener: (() -> Unit)? = null
     private var userSeeking = false
+    private var recordingStartTimeMs: Long? = null
+    private var pendingSeekPosition: Int? = null
     private val progressUpdater = object : Runnable {
         override fun run() {
             updateControls()
@@ -73,6 +81,7 @@ class RotatableVideoPlayer @JvmOverloads constructor(
     init {
         addView(textureView)
         textureView.surfaceTextureListener = this
+        controlsOverlay.addView(recordedTimeView, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         controlsOverlay.addView(seekBar, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(40)))
         buttonRow.addView(playPauseButton, LinearLayout.LayoutParams(dp(48), dp(44)))
         buttonRow.addView(timeView, LinearLayout.LayoutParams(dp(118), dp(44)))
@@ -80,7 +89,7 @@ class RotatableVideoPlayer @JvmOverloads constructor(
         buttonRow.addView(rotateButton, LinearLayout.LayoutParams(dp(48), dp(44)))
         buttonRow.addView(fullscreenButton, LinearLayout.LayoutParams(dp(48), dp(44)))
         controlsOverlay.addView(buttonRow, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(44)))
-        addView(controlsOverlay, LayoutParams(LayoutParams.MATCH_PARENT, dp(84), Gravity.BOTTOM))
+        addView(controlsOverlay, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         controlsOverlay.setOnClickListener { }
         playPauseButton.setOnClickListener { if (isPlaying()) pause() else start() }
         rotateButton.setOnClickListener { rotateListener?.invoke() }
@@ -92,7 +101,9 @@ class RotatableVideoPlayer @JvmOverloads constructor(
                 userSeeking = false
                 seekTo(seekBar.progress)
             }
-            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) = Unit
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (fromUser) updateTimeViews(progress, getDuration())
+            }
         })
     }
 
@@ -110,6 +121,11 @@ class RotatableVideoPlayer @JvmOverloads constructor(
         if (textureView.isAvailable) preparePlayer(textureView.surfaceTexture!!)
     }
 
+    fun setRecordingStartTime(startTimeMs: Long?) {
+        recordingStartTimeMs = startTimeMs
+        updateTimeViews(0, getDuration())
+    }
+
     fun setRotationDegrees(degrees: Int) {
         rotationDegrees = ((degrees % 360) + 360) % 360
         textureView.rotation = rotationDegrees.toFloat()
@@ -121,6 +137,7 @@ class RotatableVideoPlayer @JvmOverloads constructor(
         mediaPlayer?.release()
         mediaPlayer = null
         isPrepared = false
+        pendingSeekPosition = null
     }
 
     override fun onDetachedFromWindow() {
@@ -162,6 +179,10 @@ class RotatableVideoPlayer @JvmOverloads constructor(
                 this@RotatableVideoPlayer.videoWidth = width
                 this@RotatableVideoPlayer.videoHeight = height
                 requestLayout()
+            }
+            setOnSeekCompleteListener {
+                pendingSeekPosition = null
+                updateControls()
             }
             prepareAsync()
         }
@@ -218,12 +239,18 @@ class RotatableVideoPlayer @JvmOverloads constructor(
 
     private fun getDuration(): Int = if (isPrepared) mediaPlayer?.duration ?: 0 else 0
     private fun getCurrentPosition(): Int = if (isPrepared) mediaPlayer?.currentPosition ?: 0 else 0
-    private fun seekTo(position: Int) { if (isPrepared) mediaPlayer?.seekTo(position) }
+    private fun seekTo(position: Int) {
+        if (!isPrepared) return
+        pendingSeekPosition = position.coerceIn(0, getDuration().coerceAtLeast(0))
+        mediaPlayer?.seekTo(pendingSeekPosition!!)
+        updateControls()
+    }
     private fun isPlaying(): Boolean = isPrepared && mediaPlayer?.isPlaying == true
 
     private fun updateControls() {
         val duration = getDuration().coerceAtLeast(0)
-        val position = getCurrentPosition().coerceIn(0, duration.coerceAtLeast(0))
+        val position = (if (userSeeking) seekBar.progress else pendingSeekPosition ?: getCurrentPosition())
+            .coerceIn(0, duration)
         val playing = isPlaying()
         playPauseButton.setImageResource(if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
         playPauseButton.contentDescription = if (playing) "Pause" else "Play"
@@ -231,7 +258,12 @@ class RotatableVideoPlayer @JvmOverloads constructor(
             seekBar.max = duration.coerceAtLeast(1)
             seekBar.progress = position
         }
-        timeView.text = "${formatTime(position)} / ${formatTime(duration)}"
+        updateTimeViews(position, duration)
+    }
+
+    private fun updateTimeViews(positionMs: Int, durationMs: Int) {
+        timeView.text = "${formatTime(positionMs)} / ${formatTime(durationMs)}"
+        recordedTimeView.text = "Recorded time: ${PlaybackRecordingTime.format(recordingStartTimeMs, positionMs)}"
     }
 
     private fun setFullscreenState(fullscreen: Boolean, notify: Boolean) {

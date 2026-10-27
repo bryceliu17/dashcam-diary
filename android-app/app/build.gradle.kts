@@ -42,4 +42,5 @@ dependencies {
     kapt("androidx.room:room-compiler:$room")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
 }

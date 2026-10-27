@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.PowerManager
 import android.view.Surface
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceRequest
@@ -59,6 +60,9 @@ class RecordingService : LifecycleService() {
     private var segmentStart = 0L
     private var segmentFile: File? = null
     private var segmentUuid: String? = null
+    private var segmentPlaybackRotationDegrees: Int? = null
+    private var recordingCameraInfo: CameraInfo? = null
+    private val orientationTracker by lazy { RecordingOrientationTracker(this) }
     private var segmentDurationSeconds = 0
     private var stopMessage: String? = null
     private var startAlertPending = false
@@ -96,6 +100,7 @@ class RecordingService : LifecycleService() {
                 startAlertPending = true
                 stopMessage = null
                 acquireWakeLock()
+                orientationTracker.start()
                 setRecordingPreference(true)
                 broadcastState(true, null)
                 startCamera()
@@ -128,6 +133,11 @@ class RecordingService : LifecycleService() {
             }
             try {
                 val capture = bindCameraForRecording()
+                orientationTracker.awaitReady()
+                if (!continueRecording || recording != null) return@launch
+                val recordingInfo = recordingCameraInfo
+                val recordingTargetRotation = capture.targetRotation
+                segmentPlaybackRotationDegrees = null
 
                 segmentStart = System.currentTimeMillis()
                 segmentUuid = UUID.randomUUID().toString()
@@ -136,16 +146,17 @@ class RecordingService : LifecycleService() {
                 segmentFile = File(directory, filename)
                 val options = FileOutputOptions.Builder(segmentFile!!).build()
                 recording = capture.output.prepareRecording(this@RecordingService, options)
-                    .start(cameraExecutor) { event -> handleVideoEvent(event) }
+                    .start(cameraExecutor) { event -> handleVideoEvent(event, recordingInfo, recordingTargetRotation) }
             } catch (error: Exception) {
                 failAndStop("Unable to start recording: ${error.message}")
             }
         }
     }
 
-    private fun handleVideoEvent(event: VideoRecordEvent) {
+    private fun handleVideoEvent(event: VideoRecordEvent, cameraInfo: CameraInfo?, targetRotation: Int) {
         when (event) {
             is VideoRecordEvent.Start -> {
+                segmentPlaybackRotationDegrees = cameraInfo?.let { orientationTracker.cameraXExtraRotation(it, targetRotation) }
                 segmentUuid?.let { locationTracker.start(it, "video", GpsRecordingSettings.videoMode(this)) }
                 updateSegmentDuration(event)
                 if (startAlertPending) {
@@ -160,6 +171,7 @@ class RecordingService : LifecycleService() {
                 updateSegmentDuration(event)
                 val finishedFile = segmentFile
                 val finishedUuid = segmentUuid
+                val finishedRotation = segmentPlaybackRotationDegrees
                 val locationPoints = locationTracker.finish()
                 val startedAt = segmentStart
                 recording = null
@@ -178,7 +190,8 @@ class RecordingService : LifecycleService() {
                                 startTime = startedAt,
                                 endTime = endedAt,
                                 durationSeconds = durationSeconds,
-                                fileSizeBytes = finishedFile.length()
+                                fileSizeBytes = finishedFile.length(),
+                                playbackRotationDegrees = finishedRotation
                             )
                         )
                         if (locationPoints.isNotEmpty()) {
@@ -247,7 +260,7 @@ class RecordingService : LifecycleService() {
                     }
 
                     provider.unbindAll()
-                    provider.bindToLifecycle(this, selector, preview, capture)
+                    recordingCameraInfo = provider.bindToLifecycle(this, selector, preview, capture).cameraInfo
 
                     broadcastState(true, "Camera ready: $cameraName $qualityName background preview")
                     return capture
@@ -304,6 +317,7 @@ class RecordingService : LifecycleService() {
     }
 
     private fun finishService() {
+        orientationTracker.stop()
         startAlertPending = false
         setRecordingPreference(false)
         cameraProvider?.unbindAll()
@@ -395,6 +409,7 @@ class RecordingService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        orientationTracker.stop()
         // try { unregisterReceiver(powerReceiver) } catch (_: IllegalArgumentException) { }
         setRecordingPreference(false)
         cameraProvider?.unbindAll()

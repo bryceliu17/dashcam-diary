@@ -36,6 +36,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -55,6 +56,8 @@ class BackgroundRecordingService : Service() {
     private var currentFile: File? = null
     private var currentRecordingUuid: String? = null
     private var segmentStartMs = 0L
+    private var segmentPlaybackRotationDegrees: Int? = null
+    private val orientationTracker by lazy { RecordingOrientationTracker(this) }
     private var continueRecording = false
     private var stopAfterCurrentSegmentRequested = false
     private var startAlertPending = false
@@ -122,6 +125,7 @@ class BackgroundRecordingService : Service() {
         startRecordingForeground("Starting background recording")
         broadcastState(true, 0, null)
         acquireWakeLock()
+        orientationTracker.start()
         openCamera()
     }
 
@@ -176,6 +180,7 @@ class BackgroundRecordingService : Service() {
             val filename = SimpleDateFormat("'dashcam_bg_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(startedAt))
             val file = File(directory, filename)
             val recordingUuid = UUID.randomUUID().toString()
+            withContext(Dispatchers.Main.immediate) { orientationTracker.awaitReady() }
 
             mainHandler.post {
                 if (!continueRecording || !remoteStartAllowed()) { failAndStop(); return@post }
@@ -183,6 +188,7 @@ class BackgroundRecordingService : Service() {
                     currentFile = file
                     currentRecordingUuid = recordingUuid
                     segmentStartMs = startedAt
+                    segmentPlaybackRotationDegrees = null
                     broadcastState(true, 0, file.name)
                     recorder = createRecorder(file).also { it.prepare() }
                     val recorderSurface = recorder!!.surface
@@ -195,6 +201,7 @@ class BackgroundRecordingService : Service() {
                             if (!continueRecording || !remoteStartAllowed()) { session.close(); failAndStop(); return }
                             captureSession = session
                             session.setRepeatingRequest(request.build(), null, cameraHandler)
+                            segmentPlaybackRotationDegrees = capturePlaybackRotation()
                             recorder?.start()
                             locationTracker.start(recordingUuid, "video", GpsRecordingSettings.videoMode(this@BackgroundRecordingService))
                             showStartAlertOnce()
@@ -275,12 +282,24 @@ class BackgroundRecordingService : Service() {
         }
     }
 
+    private fun capturePlaybackRotation(): Int? = runCatching {
+        val cameraId = activeCameraId ?: return@runCatching null
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val info = manager.getCameraCharacteristics(cameraId)
+        orientationTracker.recorderExtraRotation(
+            info.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
+            info.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT,
+            getOrientationHintDegrees()
+        )
+    }.getOrNull()
+
     private fun stopSegment(restart: Boolean) {
         mainHandler.removeCallbacks(rotateRunnable)
         val file = currentFile
         val recordingUuid = currentRecordingUuid
         val locationPoints = locationTracker.finish()
         val startedAt = segmentStartMs
+        val finishedRotation = segmentPlaybackRotationDegrees
 
         try {
             captureSession?.stopRepeating()
@@ -315,7 +334,8 @@ class BackgroundRecordingService : Service() {
                         startTime = startedAt,
                         endTime = endedAt,
                         durationSeconds = durationSeconds,
-                        fileSizeBytes = file.length()
+                        fileSizeBytes = file.length(),
+                        playbackRotationDegrees = finishedRotation
                     )
                 )
                 if (locationPoints.isNotEmpty()) {
@@ -388,6 +408,7 @@ class BackgroundRecordingService : Service() {
     }
 
     private fun cleanupResources() {
+        orientationTracker.stop()
         RemoteRecordingControl.recorderStarted = false
         mainHandler.removeCallbacks(rotateRunnable)
         mainHandler.removeCallbacks(statusRunnable)

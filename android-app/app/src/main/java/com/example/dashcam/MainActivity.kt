@@ -42,6 +42,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -81,6 +82,7 @@ import com.example.dashcam.recording.PowerMonitorService
 import com.example.dashcam.recording.PowerRecordingSettings
 import com.example.dashcam.recording.RemoteRecordingControl
 import com.example.dashcam.recording.RecordingService
+import com.example.dashcam.recording.RecordingOrientationTracker
 import com.example.dashcam.recording.RecordingStartAlert
 import com.example.dashcam.recording.RecordingStartAlertMode
 import com.example.dashcam.recording.RecordingStartAlertSettings
@@ -195,6 +197,9 @@ class MainActivity : ComponentActivity() {
     private var segmentStart = 0L
     private var segmentFile: File? = null
     private var segmentUuid: String? = null
+    private var segmentPlaybackRotationDegrees: Int? = null
+    private var recordingCameraInfo: CameraInfo? = null
+    private val orientationTracker by lazy { RecordingOrientationTracker(this) }
     private var segmentDurationSeconds = 0
     private var manualStartTime: Long? = null
     private var completedSegmentsSinceManualStart = 0
@@ -213,8 +218,11 @@ class MainActivity : ComponentActivity() {
     private var liveError = ""
     private var audioPlayer: MediaPlayer? = null
     private var playingAudioPath: String? = null
+    private var playingAudioStartTimeMs: Long? = null
+    private var audioPlaybackPendingSeekMs: Int? = null
     private lateinit var audioPlaybackTitle: TextView
     private lateinit var audioPlaybackTime: TextView
+    private lateinit var audioPlaybackRecordedTime: TextView
     private lateinit var audioPlaybackSeekBar: SeekBar
     private lateinit var audioPlaybackButton: ImageButton
     private var audioPlaybackSeeking = false
@@ -442,6 +450,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        orientationTracker.stop()
         RemoteRecordingControl.releasePreview = null
         if (recording != null || continueRecording) stopDashcam("Activity closed")
         cameraExecutor.shutdown()
@@ -1146,7 +1155,7 @@ class MainActivity : ComponentActivity() {
             setOnItemClickListener { _, _, position, _ ->
                 selectedGpsAudio = audioFiles[position]
                 gpsPointsButton.isEnabled = selectedGpsAudio?.record != null
-                toggleAudioPlayback(audioFiles[position].file)
+                toggleAudioPlayback(audioFiles[position])
             }
             setOnItemLongClickListener { _, _, position, _ ->
                 showAudioActions(audioFiles[position])
@@ -1164,6 +1173,13 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(4), 0, dp(4), 0)
         }
         root.addView(audioPlaybackTitle, LinearLayout.LayoutParams(-1, dp(28)))
+        audioPlaybackRecordedTime = TextView(this).apply {
+            text = "Recorded time: --"
+            textSize = 13f
+            setTextColor(Color.rgb(55, 65, 81))
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+        }
+        root.addView(audioPlaybackRecordedTime, LinearLayout.LayoutParams(-1, -2))
         val playbackBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1188,6 +1204,7 @@ class MainActivity : ComponentActivity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (!fromUser) return
+                    audioPlaybackPendingSeekMs = progress
                     try { audioPlayer?.seekTo(progress) } catch (_: IllegalStateException) { }
                     updateAudioPlaybackTime(progress, seekBar?.max ?: 0)
                 }
@@ -1312,7 +1329,8 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun toggleAudioPlayback(file: File) {
+    private fun toggleAudioPlayback(audio: AudioFileInfo) {
+        val file = audio.file
         val currentPlayer = audioPlayer
         if (playingAudioPath == file.absolutePath && currentPlayer != null) {
             try {
@@ -1334,7 +1352,9 @@ class MainActivity : ComponentActivity() {
             val player = MediaPlayer()
             audioPlayer = player
             playingAudioPath = file.absolutePath
+            playingAudioStartTimeMs = audio.startedAt
             audioPlaybackTitle.text = file.name
+            updateAudioPlaybackTime(0, 0)
             player.setDataSource(file.absolutePath)
             player.setOnPreparedListener {
                 if (audioPlayer === it) {
@@ -1347,6 +1367,12 @@ class MainActivity : ComponentActivity() {
             }
             player.setOnCompletionListener {
                 if (audioPlayer === it) stopAudioPlayback()
+            }
+            player.setOnSeekCompleteListener {
+                if (audioPlayer === it) {
+                    audioPlaybackPendingSeekMs = null
+                    updateAudioPlaybackControls()
+                }
             }
             player.setOnErrorListener { _, _, _ ->
                 stopAudioPlayback()
@@ -1365,6 +1391,8 @@ class MainActivity : ComponentActivity() {
         val player = audioPlayer
         audioPlayer = null
         playingAudioPath = null
+        playingAudioStartTimeMs = null
+        audioPlaybackPendingSeekMs = null
         audioPlaybackSeeking = false
         try { player?.stop() } catch (_: IllegalStateException) { }
         player?.release()
@@ -1374,6 +1402,7 @@ class MainActivity : ComponentActivity() {
             audioPlaybackSeekBar.isEnabled = false
             audioPlaybackTitle.text = "No audio selected"
             audioPlaybackTime.text = "00:00 / 00:00"
+            audioPlaybackRecordedTime.text = "Recorded time: --"
             audioPlaybackButton.setImageResource(android.R.drawable.ic_media_play)
             audioPlaybackButton.contentDescription = "Play audio"
             audioPlaybackButton.isEnabled = false
@@ -1403,7 +1432,8 @@ class MainActivity : ComponentActivity() {
         val player = audioPlayer ?: return
         try {
             val duration = player.duration.coerceAtLeast(0)
-            val position = player.currentPosition.coerceIn(0, duration)
+            val position = (if (audioPlaybackSeeking) audioPlaybackSeekBar.progress
+                else audioPlaybackPendingSeekMs ?: player.currentPosition).coerceIn(0, duration)
             audioPlaybackSeekBar.max = duration
             if (!audioPlaybackSeeking) audioPlaybackSeekBar.progress = position
             updateAudioPlaybackTime(position, duration)
@@ -1418,6 +1448,7 @@ class MainActivity : ComponentActivity() {
     private fun updateAudioPlaybackTime(positionMs: Int, durationMs: Int) {
         if (!::audioPlaybackTime.isInitialized) return
         audioPlaybackTime.text = "${formatDuration(positionMs.toLong())} / ${formatDuration(durationMs.toLong())}"
+        audioPlaybackRecordedTime.text = "Recorded time: ${PlaybackRecordingTime.format(playingAudioStartTimeMs, positionMs)}"
     }
 
     private fun confirmDeleteAudio(file: File) {
@@ -1534,6 +1565,7 @@ class MainActivity : ComponentActivity() {
 
         var currentRotation = effectivePlaybackRotation(video)
         val player = RotatableVideoPlayer(this).apply {
+            setRecordingStartTime(video.startTime)
             setVideoPath(file.absolutePath)
             setRotationDegrees(currentRotation)
             start()
@@ -2369,6 +2401,7 @@ class MainActivity : ComponentActivity() {
         stopAfterCurrentSegment = false
         continueRecording = true
         foregroundStartAlertPending = true
+        orientationTracker.start()
         setRecordingPreference(true)
         renderRecording(true)
         mainHandler.removeCallbacks(timerRunnable)
@@ -2523,6 +2556,11 @@ class MainActivity : ComponentActivity() {
 
             try {
                 val capture = bindCameraForRecording()
+                orientationTracker.awaitReady()
+                if (!continueRecording || recording != null) return@launch
+                val recordingInfo = recordingCameraInfo
+                val recordingTargetRotation = capture.targetRotation
+                segmentPlaybackRotationDegrees = null
                 segmentStart = System.currentTimeMillis()
                 segmentUuid = UUID.randomUUID().toString()
                 segmentDurationSeconds = 0
@@ -2536,7 +2574,7 @@ class MainActivity : ComponentActivity() {
                 } else {
                     pendingRecording
                 }
-                    .start(cameraExecutor) { event -> handleVideoEvent(event) }
+                    .start(cameraExecutor) { event -> handleVideoEvent(event, recordingInfo, recordingTargetRotation) }
             } catch (error: Exception) {
                 failRecording("Unable to start recording: ${error.message}")
             }
@@ -2572,7 +2610,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     provider.unbindAll()
-                    provider.bindToLifecycle(this, selector, preview, capture)
+                    recordingCameraInfo = provider.bindToLifecycle(this, selector, preview, capture).cameraInfo
                     toast("Camera ready: $cameraName $qualityName")
                     return capture
                 } catch (error: Exception) {
@@ -2609,9 +2647,10 @@ class MainActivity : ComponentActivity() {
         throw IllegalStateException("No supported preview camera: ${lastError?.message.orEmpty()}")
     }
 
-    private fun handleVideoEvent(event: VideoRecordEvent) {
+    private fun handleVideoEvent(event: VideoRecordEvent, cameraInfo: CameraInfo?, targetRotation: Int) {
         when (event) {
             is VideoRecordEvent.Start -> {
+                segmentPlaybackRotationDegrees = cameraInfo?.let { orientationTracker.cameraXExtraRotation(it, targetRotation) }
                 segmentUuid?.let { locationTracker.start(it, "video", GpsRecordingSettings.videoMode(this)) }
                 updateSegmentDuration(event)
                 runOnUiThread {
@@ -2632,6 +2671,7 @@ class MainActivity : ComponentActivity() {
                 updateSegmentDuration(event)
                 val finishedFile = segmentFile
                 val finishedUuid = segmentUuid
+                val finishedRotation = segmentPlaybackRotationDegrees
                 val locationPoints = locationTracker.finish()
                 val startedAt = segmentStart
                 recording = null
@@ -2651,7 +2691,8 @@ class MainActivity : ComponentActivity() {
                                 startTime = startedAt,
                                 endTime = endedAt,
                                 durationSeconds = durationSeconds,
-                                fileSizeBytes = finishedFile.length()
+                                fileSizeBytes = finishedFile.length(),
+                                playbackRotationDegrees = finishedRotation
                             )
                         )
                         if (locationPoints.isNotEmpty()) {
@@ -2702,6 +2743,7 @@ class MainActivity : ComponentActivity() {
         if (continueRecording) {
             startSegment()
         } else {
+            orientationTracker.stop()
             stopAfterCurrentSegment = false
             cameraProvider?.unbindAll()
             locationTracker.cancel()
@@ -2714,6 +2756,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopDashcam(reason: String) {
+        orientationTracker.stop()
         continueRecording = false
         foregroundStartAlertPending = false
         stopAfterCurrentSegment = false
@@ -2734,6 +2777,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun failRecording(message: String) {
+        orientationTracker.stop()
         continueRecording = false
         foregroundStartAlertPending = false
         stopAfterCurrentSegment = false

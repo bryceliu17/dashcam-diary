@@ -44,6 +44,8 @@ Recording timestamps are saved in UTC. The dashboard displays them in the browse
 #### Video and audio recording
 
 - Foreground video recording with an aspect-correct preview.
+- Local video and audio playback show the recorded date/time (recording start plus playback position), including while seeking and in the fullscreen video controls. The clock uses the phone's local time zone.
+- Each continuous foreground/background recording run snapshots orientation when its first video segment starts. Every automatically split segment in that run saves and uploads the same extra playback rotation; MP4 orientation hints are left unchanged. Stopping manually or automatically (for example, in charging mode) ends the run; restarting captures a new direction, even if the dashboard groups nearby files together. Without a valid first sensor reading, existing default playback settings remain the fallback for the entire run. Manual playback rotation can still override individual recordings.
 - Manual background recording through a foreground service, including screen-off recording subject to device battery/camera policy.
 - Background video quality can be set to **Balanced (720p)** or **High (1080p)**. High mode falls back to 720p when the selected camera does not expose a 1080p camcorder profile; foreground CameraX recording keeps its existing automatic quality selection.
 - Video segment choices: 1, 3, 5, or 10 minutes, unlimited, or a custom duration. Default: 5 minutes.
@@ -289,6 +291,8 @@ React 管理页面（Docker 默认端口 8080）
 #### 视频和音频录制
 
 - 前台视频录制带有比例正确的实时预览。
+- 本地视频和音频播放器显示录制当时的日期和时间（录制开始时间加播放进度），拖动进度条时同步更新，视频全屏控制栏也显示；按手机当前时区显示。
+- 前台、后台录像都只在每次连续录制的首段开始时识别方向，自动切出的后续片段沿用同一个额外播放角度，分别存入手机数据库并随文件上传；不修改 MP4 自身的方向信息。手动或自动停止（例如充电模式停止）后，本轮结束；重新启动会重新识别，即使网页按时间将文件分在同一组也不沿用上一轮方向。首次没有有效方向读数时，整轮沿用现有默认播放设置。仍可手动修改单个视频的播放角度。
 - 后台录像由前台服务运行；在熄屏时也可录制，但仍受手机厂商的相机和省电策略影响。
 - 后台录像画质可选 **Balanced (720p)** 或 **High (1080p)**；如果当前相机不提供 1080p 录像配置，高画质模式会自动退回 720p。前台 CameraX 录像仍保留原来的自动画质选择。
 - 视频分段可选 1、3、5、10 分钟、无限或自定义；默认 5 分钟。
