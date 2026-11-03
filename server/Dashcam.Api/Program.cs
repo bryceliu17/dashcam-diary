@@ -1393,12 +1393,23 @@ app.MapPost("/api/video-exports", async (
     var timezoneOffset = request.WithTimestamp
         ? Math.Clamp(request.TimezoneOffsetMinutes, -14 * 60, 14 * 60)
         : (int?)null;
+    var timelineDuration = videos.Sum(video => (double)video.DurationSeconds) +
+        videos.Zip(videos.Skip(1), (older, newer) => VideoGapSeconds(newer, older)).Sum();
+    if ((request.StartSeconds.HasValue || request.EndSeconds.HasValue) &&
+        (!request.StartSeconds.HasValue || !request.EndSeconds.HasValue ||
+         !double.IsFinite(request.StartSeconds.Value) || !double.IsFinite(request.EndSeconds.Value) ||
+         request.StartSeconds.Value < 0 || request.EndSeconds.Value <= request.StartSeconds.Value ||
+         request.EndSeconds.Value > timelineDuration + 0.001 ||
+         request.EndSeconds.Value - request.StartSeconds.Value < 0.1))
+        return Results.BadRequest(new { error = "Choose a valid clip range of at least 0.1 seconds within the video/session." });
     var locationsByVideo = request.WithTimestamp
         ? await LoadVideoLocationsAsync(db, videos, token)
         : null;
     var first = AsUtc(videos[0].StartTime);
     var last = AsUtc(videos[^1].EndTime);
     var suffix = request.WithTimestamp ? "_with_time" : string.Empty;
+    if (request.StartSeconds.HasValue)
+        suffix += $"_clip_{request.StartSeconds.Value.ToString("0.###", CultureInfo.InvariantCulture)}-{request.EndSeconds!.Value.ToString("0.###", CultureInfo.InvariantCulture)}s";
     var filename = videos.Count == 1
         ? $"{Path.GetFileNameWithoutExtension(videos[0].OriginalFilename)}{suffix}.mp4"
         : $"dashcam_session_{first:yyyyMMdd_HHmmss}_{last:HHmmss}{suffix}.mp4";
@@ -1422,7 +1433,8 @@ app.MapPost("/api/video-exports", async (
             (_, current) => current with { Status = "processing" });
         try
         {
-            var exportPath = await CreateVideoSessionDownloadAsync(videos, timezoneOffset, locationsByVideo, CancellationToken.None);
+            var exportPath = await CreateVideoSessionDownloadAsync(videos, timezoneOffset, locationsByVideo, CancellationToken.None,
+                request.StartSeconds, request.EndSeconds);
             videoExportJobs.AddOrUpdate(
                 jobId,
                 job with { Status = "ready", ExportPath = exportPath, CompletedAtUtc = DateTime.UtcNow },
@@ -2294,7 +2306,9 @@ static async Task<string> CreateVideoSessionDownloadAsync(
     IReadOnlyList<Video> videos,
     int? timestampTimezoneOffsetMinutes,
     IReadOnlyDictionary<int, List<RecordingLocationPoint>>? locationsByVideo,
-    CancellationToken token)
+    CancellationToken token,
+    double? startSeconds = null,
+    double? endSeconds = null)
 {
     const int outputWidth = 1280;
     const int outputHeight = 720;
@@ -2313,8 +2327,18 @@ static async Task<string> CreateVideoSessionDownloadAsync(
         ? Path.Combine(temporaryDirectory, $"session-{Guid.NewGuid():N}.srt")
         : null;
     var arguments = new List<string> { "-v", "error", "-y" };
-    foreach (var video in videos)
+    var inputOffsetSeconds = 0d;
+    for (var index = 0; index < videos.Count; index++)
     {
+        var video = videos[index];
+        if (startSeconds.HasValue)
+        {
+            var inputStart = Math.Max(0, startSeconds.Value - inputOffsetSeconds);
+            if (inputStart < video.DurationSeconds && inputStart > 0)
+                arguments.AddRange(new[] { "-ss", inputStart.ToString("0.###", CultureInfo.InvariantCulture) });
+            inputOffsetSeconds += video.DurationSeconds;
+            if (index < videos.Count - 1) inputOffsetSeconds += VideoGapSeconds(videos[index + 1], video);
+        }
         arguments.Add("-i");
         arguments.Add(video.FilePath);
     }
@@ -2324,47 +2348,64 @@ static async Task<string> CreateVideoSessionDownloadAsync(
     var timestampSegments = new List<TimestampSegment>();
     var outputOffsetSeconds = 0d;
     var segmentCount = 0;
+    var sourceOffsetSeconds = 0d;
     for (var index = 0; index < videos.Count; index++)
     {
-        var duration = FormatFfmpegSeconds(media[index].DurationSeconds);
-        var contentHeight = timestampTimezoneOffsetMinutes.HasValue
-            ? outputHeight - timestampBarHeight
-            : outputHeight;
-        var verticalOffset = timestampTimezoneOffsetMinutes.HasValue ? "0" : "(oh-ih)/2";
-        var rotation = videos[index].PlaybackRotationDegrees switch
+        // Clip exports follow exactly the same metadata-based timeline as the web session player.
+        var sourceDuration = startSeconds.HasValue ? Math.Max(0.001, videos[index].DurationSeconds) : media[index].DurationSeconds;
+        var clipStart = Math.Max(0, (startSeconds ?? 0) - sourceOffsetSeconds);
+        var clipEnd = Math.Min(sourceDuration, (endSeconds ?? double.MaxValue) - sourceOffsetSeconds);
+        sourceOffsetSeconds += sourceDuration;
+        if (clipEnd > clipStart)
         {
-            90 => ",transpose=clock",
-            180 => ",hflip,vflip",
-            270 => ",transpose=cclock",
-            _ => string.Empty
-        };
-        filters.Add(
-            $"[{index}:v:0]trim=duration={duration},setpts=PTS-STARTPTS{rotation}," +
-            $"scale={outputWidth}:{contentHeight}:force_original_aspect_ratio=decrease," +
-            $"pad={outputWidth}:{outputHeight}:(ow-iw)/2:{verticalOffset}:black," +
-            $"setsar=1,fps={outputFrameRate},format=yuv420p[v{index}]");
-        if (media[index].HasAudio)
-        {
+            var clipDuration = clipEnd - clipStart;
+            var duration = FormatFfmpegSeconds(clipDuration);
+            // Input seeking avoids decoding the entire prefix of a five-minute source file.
+            var trimStart = "0";
+            var contentHeight = timestampTimezoneOffsetMinutes.HasValue
+                ? outputHeight - timestampBarHeight
+                : outputHeight;
+            var verticalOffset = timestampTimezoneOffsetMinutes.HasValue ? "0" : "(oh-ih)/2";
+            var rotation = videos[index].PlaybackRotationDegrees switch
+            {
+                90 => ",transpose=clock",
+                180 => ",hflip,vflip",
+                270 => ",transpose=cclock",
+                _ => string.Empty
+            };
             filters.Add(
-                $"[{index}:a:0]atrim=duration={duration},asetpts=PTS-STARTPTS," +
-                $"aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]");
+                $"[{index}:v:0]tpad=stop_mode=clone:stop_duration={duration},trim=start={trimStart}:duration={duration},setpts=PTS-STARTPTS{rotation}," +
+                $"scale={outputWidth}:{contentHeight}:force_original_aspect_ratio=decrease," +
+                $"pad={outputWidth}:{outputHeight}:(ow-iw)/2:{verticalOffset}:black," +
+                $"setsar=1,fps={outputFrameRate},format=yuv420p[v{index}]");
+            if (media[index].HasAudio)
+            {
+                filters.Add(
+                    $"[{index}:a:0]atrim=start={trimStart}:duration={duration},asetpts=PTS-STARTPTS,apad,atrim=duration={duration}," +
+                    $"aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]");
+            }
+            else
+            {
+                filters.Add($"anullsrc=channel_layout=stereo:sample_rate=44100:d={duration}[a{index}]");
+            }
+            concatInputs.Add($"[v{index}][a{index}]");
+            timestampSegments.Add(new TimestampSegment(
+                outputOffsetSeconds,
+                clipDuration,
+                AsUtc(videos[index].StartTime).AddSeconds(clipStart),
+                locationsByVideo?.GetValueOrDefault(videos[index].Id)));
+            outputOffsetSeconds += clipDuration;
+            segmentCount++;
         }
-        else
-        {
-            filters.Add($"anullsrc=channel_layout=stereo:sample_rate=44100:d={duration}[a{index}]");
-        }
-        concatInputs.Add($"[v{index}][a{index}]");
-        timestampSegments.Add(new TimestampSegment(
-            outputOffsetSeconds,
-            media[index].DurationSeconds,
-            AsUtc(videos[index].StartTime),
-            locationsByVideo?.GetValueOrDefault(videos[index].Id)));
-        outputOffsetSeconds += media[index].DurationSeconds;
-        segmentCount++;
 
         if (index >= videos.Count - 1) continue;
         var gapSeconds = VideoGapSeconds(videos[index + 1], videos[index]);
         if (gapSeconds <= 0) continue;
+        var gapStart = Math.Max(0, (startSeconds ?? 0) - sourceOffsetSeconds);
+        var gapEnd = Math.Min(gapSeconds, (endSeconds ?? double.MaxValue) - sourceOffsetSeconds);
+        sourceOffsetSeconds += gapSeconds;
+        if (gapEnd <= gapStart) continue;
+        gapSeconds = gapEnd - gapStart;
         var gapDuration = FormatFfmpegSeconds(gapSeconds);
         filters.Add($"color=c=black:s={outputWidth}x{outputHeight}:r={outputFrameRate}:d={gapDuration}[gapv{index}]");
         filters.Add($"anullsrc=channel_layout=stereo:sample_rate=44100:d={gapDuration}[gapa{index}]");
@@ -2372,7 +2413,7 @@ static async Task<string> CreateVideoSessionDownloadAsync(
         timestampSegments.Add(new TimestampSegment(
             outputOffsetSeconds,
             gapSeconds,
-            AsUtc(videos[index].EndTime),
+            AsUtc(videos[index].EndTime).AddSeconds(gapStart),
             null));
         outputOffsetSeconds += gapSeconds;
         segmentCount++;
@@ -3527,7 +3568,8 @@ public sealed record UploadedLocationPoint(
     string? Provider);
 public sealed record ArchiveStorageSettingsRequest(double MaxVideoStorageGb, double MaxAudioStorageGb);
 public sealed record MobileUploadSettingsRequest(bool AcceptMobileUploads);
-public sealed record VideoExportRequest(int[] Ids, bool WithTimestamp, int TimezoneOffsetMinutes);
+public sealed record VideoExportRequest(int[] Ids, bool WithTimestamp, int TimezoneOffsetMinutes,
+    double? StartSeconds = null, double? EndSeconds = null);
 public sealed record AudioExportRequest(int[] Ids);
 public sealed record VideoExportJob(
     Guid Id,

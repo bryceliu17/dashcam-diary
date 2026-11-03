@@ -95,6 +95,7 @@ Start alerts are configured independently of the recording mode. The choices are
 
 - Separate video and audio archives with paging, date/lock filtering, and date availability indicators.
 - Range-enabled playback, playback rotation, original downloads, timestamp-overlay video downloads, and session downloads/exports.
+- Individual video and session players offer **Export a clip**: mark start/end at the current playback position or enter seconds, then download only that range. Cross-file clips preserve rotation, audio/silence and short black intervals, with optional date/time/GPS/speed overlays. Precise clip exports are re-encoded using the existing 720p session-export pipeline; source recordings are never changed.
 - Group nearby recordings into sessions for continuous video or audio playback while retaining individual controls.
 - Video and audio rows show their source device. The source can be changed to another known device, `Unknown`, or blank; session grouping never crosses a source-device boundary.
 - Recordings with GPS data expose an interactive OpenStreetMap route, route summary, and GPX download. During individual or grouped-session video and audio playback, the map follows the playback time, highlights the travelled route, and lets the user click the route to seek. Session gaps and segments without GPS data have no current-position marker. Map tiles load only when the user opens a GPS track or plays GPS-enabled media.
@@ -342,6 +343,7 @@ React 管理页面（Docker 默认端口 8080）
 
 - 视频和音频独立归档，支持分页、日期/锁定筛选和有录制日期提示。
 - 支持 Range 播放、播放旋转、原视频下载、带时间戳的视频下载，以及 session 下载/导出。
+- 单个视频和 session 播放器支持 **Export a clip**：在当前播放位置设定起点、终点，或直接输入秒数，只下载所选区间。跨文件截取保留旋转、声音/静音和短暂黑屏间隔，可选叠加日期、时间、GPS、速度。精确截取沿用现有 720p session 导出流程重新编码，不改动原始录像。
 - 将相邻录制分组为 session 连续播放，同时保留单个文件控制。
 - 视频和音频会显示来源设备；网页可改成其他已知设备、`Unknown` 或留空，session 不会跨不同来源设备分组。
 - 有 GPS 数据的文件可以在交互式 OpenStreetMap 上查看轨迹、轨迹摘要并下载 GPX。单独播放或按 session 连续播放视频、音频时，地图会随播放时间移动、突出显示已经走过的路线，也可以点击轨迹跳到对应时刻。片段间隔或没有 GPS 数据的片段不显示当前位置；只有打开轨迹或播放带 GPS 的媒体时才加载地图图块。

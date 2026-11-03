@@ -833,7 +833,38 @@ function RotatedVideo({
   </div>
 }
 
-function SessionPlayback({ session }) {
+function ClipExportControls({ recordings, position, duration, onExport, busy }) {
+  const [start, setStart] = useState('0')
+  const [end, setEnd] = useState(String(duration))
+  const [withTimestamp, setWithTimestamp] = useState(false)
+  const [exportError, setExportError] = useState('')
+  const startSeconds = Number(start)
+  const endSeconds = Number(end)
+  const valid = start !== '' && end !== '' && Number.isFinite(startSeconds) && Number.isFinite(endSeconds)
+    && startSeconds >= 0 && endSeconds <= duration && endSeconds - startSeconds >= 0.1
+  const mark = value => String(Math.round(Math.max(0, Math.min(duration, value)) * 1000) / 1000)
+  return <details className="clip-export">
+    <summary>Export a clip</summary>
+    <div className="clip-export-fields">
+      <label>Start (seconds)<input type="number" min="0" max={duration} step="0.1" value={start} onChange={event => setStart(event.target.value)} /></label>
+      <button type="button" onClick={() => setStart(mark(position))}>Set start here</button>
+      <label>End (seconds)<input type="number" min="0" max={duration} step="0.1" value={end} onChange={event => setEnd(event.target.value)} /></label>
+      <button type="button" onClick={() => setEnd(mark(position))}>Set end here</button>
+    </div>
+    <p>{formatTimelineDuration(startSeconds)} → {formatTimelineDuration(endSeconds)} · {valid ? `${(endSeconds - startSeconds).toFixed(1)} seconds` : 'Choose at least 0.1 seconds within this video/session.'}</p>
+    <label className="clip-export-overlay"><input type="checkbox" checked={withTimestamp} onChange={event => setWithTimestamp(event.target.checked)} />Include date, time, GPS and speed</label>
+    <button type="button" className="primary" disabled={!valid || busy} onClick={async () => {
+      setExportError('')
+      const failure = await onExport({ key: `clip-${recordings[0].id}`, ids: recordings.map(recording => recording.id), withTimestamp, startSeconds, endSeconds })
+      if (failure) setExportError(failure)
+    }}><Icon name="download" />{busy ? 'Export in progress…' : 'Download selected clip'}</button>
+    {busy && <p role="status">Preparing the video. Keep this page open; the download starts automatically.</p>}
+    {exportError && <p role="alert">{exportError}</p>}
+    <small>Original files are unchanged. Rotation and short black intervals are preserved. Precise clips use the existing 720p session export quality and are re-encoded; data overlays take additional time.</small>
+  </details>
+}
+
+function SessionPlayback({ session, onExport, exportBusy }) {
   const clips = session.videos
   const hasGps = clips.some(clip => Number(clip.gpsPointCount) > 0)
   const [mapVisible, setMapVisible] = useState(true)
@@ -1037,6 +1068,7 @@ function SessionPlayback({ session }) {
       gpsPlaybackTime={displayedPosition}
       gpsActiveGroup={gapEntry ? null : clipIndex}
     />
+    <ClipExportControls recordings={clips} position={displayedPosition} duration={timeline.duration} onExport={onExport} busy={exportBusy} />
     </div>
     {hasGps && mapVisible && <SessionGpsPlayback track={gpsTrack}
       playbackTime={displayedPosition} activeGroup={gapEntry ? null : clipIndex} onSeek={seekSession} />}
@@ -1209,7 +1241,7 @@ function WaveformAudio({ recording, autoPlay = true, showWaveform = true, onPlay
   </div>
 }
 
-function VideoPlaybackModal({ recording, onClose, onRotate }) {
+function VideoPlaybackModal({ recording, onClose, onRotate, onExport, exportBusy }) {
   const fullscreenRef = useRef(null)
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
@@ -1233,9 +1265,10 @@ function VideoPlaybackModal({ recording, onClose, onRotate }) {
           initialTime={seekRequest.time}
           seekVersion={seekRequest.version}
           onPlaybackTime={setPlaybackTime}
-          fullscreenTargetRef={hasGps ? fullscreenRef : undefined}
+          fullscreenTargetRef={fullscreenRef}
           gpsTrack={hasGps ? gpsTrack : undefined}
         />
+        <ClipExportControls key={recording.id} recordings={[recording]} position={playbackTime} duration={Number(recording.durationSeconds) || 0} onExport={onExport} busy={exportBusy} />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)} | Playback {recording.playbackRotationDegrees || 0} deg</p>
       </div>
       {hasGps && mapVisible && <MediaGpsPlayback track={gpsTrack} playbackTime={playbackTime} onSeek={seekFromMap} />}
@@ -2378,7 +2411,7 @@ export default function App() {
     } : item))
   }, [])
 
-  const startVideoExport = async ({ key, ids, withTimestamp }) => {
+  const startVideoExport = async ({ key, ids, withTimestamp, startSeconds, endSeconds }) => {
     if (videoExportActive.current) return
     videoExportActive.current = true
     setError('')
@@ -2390,6 +2423,8 @@ export default function App() {
         body: JSON.stringify({
           ids,
           withTimestamp,
+          startSeconds,
+          endSeconds,
           timezoneOffsetMinutes: new Date().getTimezoneOffset(),
         }),
       })
@@ -2416,6 +2451,7 @@ export default function App() {
       videoExportActive.current = false
       setVideoExport(null)
       setError(err.message)
+      return err.message
     }
   }
 
@@ -3436,10 +3472,10 @@ export default function App() {
         videoRecordingActive: result.backgroundRecordingActive, audioRecordingActive: result.audioRecordingActive,
       } : device))}
     />}
-    {selected && <VideoPlaybackModal recording={selected} onClose={() => setSelected(null)} onRotate={rotatePlayback} />}
+    {selected && <VideoPlaybackModal recording={selected} onClose={() => setSelected(null)} onRotate={rotatePlayback} onExport={startVideoExport} exportBusy={videoExportBusy || rotatingVideoIds.has(selected.id)} />}
     {selectedSession && <div className="modal" onMouseDown={() => setSelectedSession(null)}><div className={`player session-player ${selectedSession.videos.some(video => Number(video.gpsPointCount) > 0) ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedSession.number} · {selectedSession.count} {selectedSession.count === 1 ? 'video' : 'videos'}</strong><span className="player-actions"><button className="close-player" aria-label="Close session player" onClick={() => setSelectedSession(null)}>X</button></span></div>
-      <SessionPlayback key={selectedSession.number} session={selectedSession} />
+      <SessionPlayback key={selectedSession.number} session={selectedSession} onExport={startVideoExport} exportBusy={videoExportBusy || selectedSession.videos.some(video => rotatingVideoIds.has(video.id))} />
       <p>{formatDate(selectedSession.videos[0].startTime)} to {formatDate(selectedSession.videos.at(-1).endTime)} | {formatTotalDuration(selectedSession.durationSeconds)} including short black intervals</p>
     </div></div>}
     {selectedAudio && <AudioPlaybackModal recording={selectedAudio} onClose={() => setSelectedAudio(null)} />}
