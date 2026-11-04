@@ -1266,11 +1266,22 @@ app.MapPost("/api/audio-exports", async (
     if (recordings.Zip(recordings.Skip(1), (older, newer) => AudioGapSeconds(newer, older)).Any(gap => gap > 5))
         return Results.BadRequest(new { error = "The selected audio recordings do not form one continuous session." });
 
+    var timelineDuration = recordings.Sum(recording => (double)recording.DurationSeconds) +
+        recordings.Zip(recordings.Skip(1), (older, newer) => AudioGapSeconds(newer, older)).Sum();
+    if ((request.StartSeconds.HasValue || request.EndSeconds.HasValue) &&
+        (!request.StartSeconds.HasValue || !request.EndSeconds.HasValue ||
+         !double.IsFinite(request.StartSeconds.Value) || !double.IsFinite(request.EndSeconds.Value) ||
+         request.StartSeconds.Value < 0 || request.EndSeconds.Value > timelineDuration + 0.001 ||
+         request.EndSeconds.Value - request.StartSeconds.Value < 0.1))
+        return Results.BadRequest(new { error = "Choose a valid audio range of at least 0.1 seconds within the recording/session." });
+
     var first = AsUtc(recordings[0].StartTime);
     var last = AsUtc(recordings[^1].EndTime);
     var filename = recordings.Count == 1
         ? Path.ChangeExtension(recordings[0].OriginalFilename, ".m4a")
         : $"dashcam_audio_session_{first:yyyyMMdd_HHmmss}_{last:HHmmss}.m4a";
+    if (request.StartSeconds.HasValue)
+        filename = $"{Path.GetFileNameWithoutExtension(filename)}_clip_{request.StartSeconds.Value.ToString("0.###", CultureInfo.InvariantCulture)}-{request.EndSeconds!.Value.ToString("0.###", CultureInfo.InvariantCulture)}s.m4a";
     var jobId = Guid.NewGuid();
     var job = new AudioExportJob(
         jobId,
@@ -1291,7 +1302,7 @@ app.MapPost("/api/audio-exports", async (
             (_, current) => current with { Status = "processing" });
         try
         {
-            var exportPath = await CreateAudioSessionDownloadAsync(recordings, CancellationToken.None);
+            var exportPath = await CreateAudioSessionDownloadAsync(recordings, CancellationToken.None, request.StartSeconds, request.EndSeconds);
             audioExportJobs.AddOrUpdate(
                 jobId,
                 job with { Status = "ready", ExportPath = exportPath, CompletedAtUtc = DateTime.UtcNow },
@@ -2231,7 +2242,9 @@ static void CleanupAudioExportJobs(ConcurrentDictionary<Guid, AudioExportJob> jo
 
 static async Task<string> CreateAudioSessionDownloadAsync(
     IReadOnlyList<AudioRecording> recordings,
-    CancellationToken token)
+    CancellationToken token,
+    double? startSeconds = null,
+    double? endSeconds = null)
 {
     var temporaryDirectory = Path.Combine(
         Path.GetDirectoryName(recordings[0].FilePath) ?? Path.GetTempPath(),
@@ -2239,26 +2252,47 @@ static async Task<string> CreateAudioSessionDownloadAsync(
     Directory.CreateDirectory(temporaryDirectory);
     var temporaryPath = Path.Combine(temporaryDirectory, $"audio-session-{Guid.NewGuid():N}.m4a");
     var arguments = new List<string> { "-v", "error", "-y" };
-    foreach (var recording in recordings)
+    var inputOffset = 0d;
+    for (var index = 0; index < recordings.Count; index++)
     {
+        var recording = recordings[index];
+        var inputStart = Math.Max(0, (startSeconds ?? 0) - inputOffset);
+        if (startSeconds.HasValue && inputStart > 0 && inputStart < recording.DurationSeconds)
+            arguments.AddRange(new[] { "-ss", inputStart.ToString("0.###", CultureInfo.InvariantCulture) });
         arguments.Add("-i");
         arguments.Add(recording.FilePath);
+        inputOffset += recording.DurationSeconds;
+        if (index < recordings.Count - 1) inputOffset += AudioGapSeconds(recordings[index + 1], recording);
     }
 
     var filters = new List<string>();
     var concatInputs = new List<string>();
     var segmentCount = 0;
+    var sourceOffset = 0d;
     for (var index = 0; index < recordings.Count; index++)
     {
-        filters.Add(
-            $"[{index}:a:0]asetpts=PTS-STARTPTS," +
-            $"aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]");
-        concatInputs.Add($"[a{index}]");
-        segmentCount++;
+        var localStart = Math.Max(0, (startSeconds ?? 0) - sourceOffset);
+        var localEnd = Math.Min(recordings[index].DurationSeconds, (endSeconds ?? double.MaxValue) - sourceOffset);
+        sourceOffset += recordings[index].DurationSeconds;
+        if (!startSeconds.HasValue || localEnd > localStart)
+        {
+            var trim = startSeconds.HasValue
+                ? $"apad,atrim=duration={FormatFfmpegSeconds(localEnd - localStart)}," : string.Empty;
+            filters.Add(
+                $"[{index}:a:0]asetpts=PTS-STARTPTS,{trim}" +
+                $"aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]");
+            concatInputs.Add($"[a{index}]");
+            segmentCount++;
+        }
 
         if (index >= recordings.Count - 1) continue;
         var gapSeconds = AudioGapSeconds(recordings[index + 1], recordings[index]);
         if (gapSeconds <= 0) continue;
+        var gapStart = Math.Max(0, (startSeconds ?? 0) - sourceOffset);
+        var gapEnd = Math.Min(gapSeconds, (endSeconds ?? double.MaxValue) - sourceOffset);
+        sourceOffset += gapSeconds;
+        if (gapEnd <= gapStart) continue;
+        gapSeconds = gapEnd - gapStart;
         var gapDuration = FormatFfmpegSeconds(gapSeconds);
         filters.Add($"anullsrc=channel_layout=stereo:sample_rate=44100:d={gapDuration}[gap{index}]");
         concatInputs.Add($"[gap{index}]");
@@ -3570,7 +3604,7 @@ public sealed record ArchiveStorageSettingsRequest(double MaxVideoStorageGb, dou
 public sealed record MobileUploadSettingsRequest(bool AcceptMobileUploads);
 public sealed record VideoExportRequest(int[] Ids, bool WithTimestamp, int TimezoneOffsetMinutes,
     double? StartSeconds = null, double? EndSeconds = null);
-public sealed record AudioExportRequest(int[] Ids);
+public sealed record AudioExportRequest(int[] Ids, double? StartSeconds = null, double? EndSeconds = null);
 public sealed record VideoExportJob(
     Guid Id,
     string Status,

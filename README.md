@@ -95,6 +95,7 @@ Start alerts are configured independently of the recording mode. The choices are
 
 - Separate video and audio archives with paging, date/lock filtering, and date availability indicators.
 - Range-enabled playback, playback rotation, original downloads, timestamp-overlay video downloads, and session downloads/exports.
+- Individual audio and audio-session players also support **Export a clip**, using playback-position markers or explicit start/end seconds. Cross-file exports preserve short silent gaps and use AAC/M4A at 128 kbps; original recordings and transcripts remain unchanged.
 - Individual video and session players offer **Export a clip**: mark start/end at the current playback position or enter seconds, then download only that range. Cross-file clips preserve rotation, audio/silence and short black intervals, with optional date/time/GPS/speed overlays. Precise clip exports are re-encoded using the existing 720p session-export pipeline; source recordings are never changed.
 - Group nearby recordings into sessions for continuous video or audio playback while retaining individual controls.
 - Video and audio rows show their source device. The source can be changed to another known device, `Unknown`, or blank; session grouping never crosses a source-device boundary.
@@ -343,6 +344,7 @@ React 管理页面（Docker 默认端口 8080）
 
 - 视频和音频独立归档，支持分页、日期/锁定筛选和有录制日期提示。
 - 支持 Range 播放、播放旋转、原视频下载、带时间戳的视频下载，以及 session 下载/导出。
+- 单个音频和音频 session 播放器也支持 **Export a clip**，可在播放位置标记起止点或输入秒数。跨文件导出保留短暂静音间隔，以 AAC/M4A、128 kbps 输出，不改动原录音和转写稿。
 - 单个视频和 session 播放器支持 **Export a clip**：在当前播放位置设定起点、终点，或直接输入秒数，只下载所选区间。跨文件截取保留旋转、声音/静音和短暂黑屏间隔，可选叠加日期、时间、GPS、速度。精确截取沿用现有 720p session 导出流程重新编码，不改动原始录像。
 - 将相邻录制分组为 session 连续播放，同时保留单个文件控制。
 - 视频和音频会显示来源设备；网页可改成其他已知设备、`Unknown` 或留空，session 不会跨不同来源设备分组。

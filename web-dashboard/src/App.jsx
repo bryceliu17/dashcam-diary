@@ -833,7 +833,7 @@ function RotatedVideo({
   </div>
 }
 
-function ClipExportControls({ recordings, position, duration, onExport, busy }) {
+function ClipExportControls({ recordings, position, duration, onExport, busy, audio = false }) {
   const [start, setStart] = useState('0')
   const [end, setEnd] = useState(String(duration))
   const [withTimestamp, setWithTimestamp] = useState(false)
@@ -851,16 +851,16 @@ function ClipExportControls({ recordings, position, duration, onExport, busy }) 
       <label>End (seconds)<input type="number" min="0" max={duration} step="0.1" value={end} onChange={event => setEnd(event.target.value)} /></label>
       <button type="button" onClick={() => setEnd(mark(position))}>Set end here</button>
     </div>
-    <p>{formatTimelineDuration(startSeconds)} → {formatTimelineDuration(endSeconds)} · {valid ? `${(endSeconds - startSeconds).toFixed(1)} seconds` : 'Choose at least 0.1 seconds within this video/session.'}</p>
-    <label className="clip-export-overlay"><input type="checkbox" checked={withTimestamp} onChange={event => setWithTimestamp(event.target.checked)} />Include date, time, GPS and speed</label>
+    <p>{formatTimelineDuration(startSeconds)} → {formatTimelineDuration(endSeconds)} · {valid ? `${(endSeconds - startSeconds).toFixed(1)} seconds` : `Choose at least 0.1 seconds within this ${audio ? 'audio recording' : 'video'}/session.`}</p>
+    {!audio && <label className="clip-export-overlay"><input type="checkbox" checked={withTimestamp} onChange={event => setWithTimestamp(event.target.checked)} />Include date, time, GPS and speed</label>}
     <button type="button" className="primary" disabled={!valid || busy} onClick={async () => {
       setExportError('')
       const failure = await onExport({ key: `clip-${recordings[0].id}`, ids: recordings.map(recording => recording.id), withTimestamp, startSeconds, endSeconds })
       if (failure) setExportError(failure)
     }}><Icon name="download" />{busy ? 'Export in progress…' : 'Download selected clip'}</button>
-    {busy && <p role="status">Preparing the video. Keep this page open; the download starts automatically.</p>}
+    {busy && <p role="status">Preparing the {audio ? 'audio' : 'video'}. Keep this page open; the download starts automatically.</p>}
     {exportError && <p role="alert">{exportError}</p>}
-    <small>Original files are unchanged. Rotation and short black intervals are preserved. Precise clips use the existing 720p session export quality and are re-encoded; data overlays take additional time.</small>
+    <small>{audio ? 'Original recordings are unchanged. Short silent intervals are preserved. Selected audio is re-encoded to AAC / M4A at 128 kbps, matching session exports.' : 'Original files are unchanged. Rotation and short black intervals are preserved. Precise clips use the existing 720p session export quality and are re-encoded; data overlays take additional time.'}</small>
   </details>
 }
 
@@ -1268,7 +1268,7 @@ function VideoPlaybackModal({ recording, onClose, onRotate, onExport, exportBusy
           fullscreenTargetRef={fullscreenRef}
           gpsTrack={hasGps ? gpsTrack : undefined}
         />
-        <ClipExportControls key={recording.id} recordings={[recording]} position={playbackTime} duration={Number(recording.durationSeconds) || 0} onExport={onExport} busy={exportBusy} />
+        <ClipExportControls key={`clip-${recording.id}`} recordings={[recording]} position={playbackTime} duration={Number(recording.durationSeconds) || 0} onExport={onExport} busy={exportBusy} />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)} | Playback {recording.playbackRotationDegrees || 0} deg</p>
       </div>
       {hasGps && mapVisible && <MediaGpsPlayback track={gpsTrack} playbackTime={playbackTime} onSeek={seekFromMap} />}
@@ -1276,7 +1276,7 @@ function VideoPlaybackModal({ recording, onClose, onRotate, onExport, exportBusy
   </div></div>
 }
 
-function AudioPlaybackModal({ recording, onClose }) {
+function AudioPlaybackModal({ recording, onClose, onExport, exportBusy }) {
   const [playbackTime, setPlaybackTime] = useState(0)
   const [seekRequest, setSeekRequest] = useState({ time: 0, version: 0 })
   const hasGps = Number(recording.gpsPointCount) > 0
@@ -1292,6 +1292,7 @@ function AudioPlaybackModal({ recording, onClose }) {
     <div className="media-playback-grid">
       <div className="media-playback-main">
         <WaveformAudio key={recording.id} recording={recording} onPlaybackTime={setPlaybackTime} seekRequest={seekRequest} gpsTrack={hasGps ? gpsTrack : undefined} />
+        <ClipExportControls audio key={`clip-${recording.id}`} recordings={[recording]} position={playbackTime} duration={Number(recording.durationSeconds) || 0} onExport={onExport} busy={exportBusy} />
         <p>{formatDate(recording.startTime)} | {formatDuration(recording.durationSeconds)} | {formatBytes(recording.fileSizeBytes)}</p>
       </div>
       {hasGps && mapVisible && <MediaGpsPlayback track={gpsTrack} playbackTime={playbackTime} onSeek={seekFromMap} />}
@@ -1399,7 +1400,7 @@ function SessionTranscript({ recordings, entries, playbackTime, onSeek }) {
   </section>
 }
 
-function AudioSessionPlayback({ session }) {
+function AudioSessionPlayback({ session, onExport, exportBusy }) {
   const recordings = session.recordings
   const hasGps = recordings.some(recording => Number(recording.gpsPointCount) > 0)
   const [mapVisible, setMapVisible] = useState(true)
@@ -1761,6 +1762,7 @@ function AudioSessionPlayback({ session }) {
         </select>
       </div>
     </div>
+    <ClipExportControls audio recordings={recordings} position={displayedPosition} duration={timeline.duration} onExport={onExport} busy={exportBusy} />
     </div>
     {hasGps && mapVisible && <SessionGpsPlayback track={gpsTrack}
       playbackTime={displayedPosition} activeGroup={gapEntry ? null : recordingIndex} onSeek={seekSession} />}
@@ -2455,7 +2457,7 @@ export default function App() {
     }
   }
 
-  const startAudioExport = async ({ key, ids }) => {
+  const startAudioExport = async ({ key, ids, startSeconds, endSeconds }) => {
     if (audioExportActive.current) return
     audioExportActive.current = true
     setError('')
@@ -2464,7 +2466,7 @@ export default function App() {
       let job = await api('/api/audio-exports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids }),
+        body: JSON.stringify({ ids, startSeconds, endSeconds }),
       })
       while (job.status === 'queued' || job.status === 'processing') {
         setAudioExport({ key, status: job.status, filename: job.filename || '' })
@@ -2489,6 +2491,7 @@ export default function App() {
       audioExportActive.current = false
       setAudioExport(null)
       setError(err.message)
+      return err.message
     }
   }
 
@@ -3478,10 +3481,10 @@ export default function App() {
       <SessionPlayback key={selectedSession.number} session={selectedSession} onExport={startVideoExport} exportBusy={videoExportBusy || selectedSession.videos.some(video => rotatingVideoIds.has(video.id))} />
       <p>{formatDate(selectedSession.videos[0].startTime)} to {formatDate(selectedSession.videos.at(-1).endTime)} | {formatTotalDuration(selectedSession.durationSeconds)} including short black intervals</p>
     </div></div>}
-    {selectedAudio && <AudioPlaybackModal recording={selectedAudio} onClose={() => setSelectedAudio(null)} />}
+    {selectedAudio && <AudioPlaybackModal recording={selectedAudio} onClose={() => setSelectedAudio(null)} onExport={startAudioExport} exportBusy={Boolean(audioExport)} />}
     {selectedAudioSession && <div className="modal" onMouseDown={() => setSelectedAudioSession(null)}><div className={`player audio-session-player ${selectedAudioSession.recordings.some(recording => Number(recording.gpsPointCount) > 0) ? 'has-gps' : ''}`} onMouseDown={event => event.stopPropagation()}>
       <div><strong>Session {selectedAudioSession.number} | {selectedAudioSession.count} {selectedAudioSession.count === 1 ? 'recording' : 'recordings'}</strong><button className="close-player" aria-label="Close audio session player" onClick={() => setSelectedAudioSession(null)}>X</button></div>
-      <AudioSessionPlayback key={selectedAudioSession.number} session={selectedAudioSession} />
+      <AudioSessionPlayback key={selectedAudioSession.number} session={selectedAudioSession} onExport={startAudioExport} exportBusy={Boolean(audioExport)} />
       <p>{formatDate(selectedAudioSession.recordings[0].startTime)} to {formatDate(selectedAudioSession.recordings.at(-1).endTime)} | {formatTotalDuration(selectedAudioSession.durationSeconds)} including short silent intervals</p>
     </div></div>}
     {selectedTranscript && <TranscriptViewer transcript={selectedTranscript} onClose={() => setSelectedTranscript(null)} onDelete={deleteAudioTranscript} onRenameSpeakers={renameTranscriptSpeakers} />}
