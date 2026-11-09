@@ -11,7 +11,7 @@ The phone remains the source of truth until an upload succeeds. A server outage 
 | Path | Android support | Default phone video archive | Camera implementation | Responsibility |
 |---|---:|---:|---|---|
 | `android-app/` | Android 8.0 / API 26+ | 25 GiB | CameraX for foreground preview recording; Camera2 for background recording and Live Access | Current Android client |
-| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | Legacy `android.hardware.Camera` on Android 5/5.1; Camera2 only on newer systems | Android 5-compatible client |
+| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | CameraX for foreground recording; Camera2 for background recording; legacy Camera for Live Access on Android 5/5.1 | Android 5-compatible client |
 | `server/`, `web-dashboard/`, `transcription-worker/` | Both clients | Server-configured | Shared API and browser UI | Server, dashboard, and transcription |
 
 Both Android clients are maintained together on `main`. The old `android-5-compatible` branch is retained only as a historical backup and is no longer a development or deployment source.
@@ -260,7 +260,7 @@ Its APK is written to `android-app-legacy\app\build\outputs\apk\debug\app-debug.
 | 路径 | Android 支持 | 手机视频默认归档上限 | 相机实现 | 负责范围 |
 |---|---:|---:|---|---|
 | `android-app/` | Android 8.0 / API 26+ | 25 GiB | 前台预览录制使用 CameraX；后台录像和 Live Access 使用 Camera2 | 当前 Android 客户端 |
-| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | Android 5/5.1 使用旧 `android.hardware.Camera`；更高版本系统才使用 Camera2 | Android 5 兼容客户端 |
+| `android-app-legacy/` | Android 5.0 / API 21+ | 5.5 GiB | 前台录像使用 CameraX；后台录像使用 Camera2；Android 5/5.1 的 Live Access 使用旧 Camera API | Android 5 兼容客户端 |
 | `server/`、`web-dashboard/`、`transcription-worker/` | 两个客户端 | 服务端设置 | 共用 API 和网页 | 服务端、管理页和转写 |
 
 两个 Android 客户端现在都在 `main` 中维护。旧 `android-5-compatible` 分支只作为历史备份保留，不再用于开发或部署。

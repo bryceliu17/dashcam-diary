@@ -9,8 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.SurfaceTexture
-import android.hardware.Camera
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -24,7 +22,6 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
-import android.view.Surface
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.dashcam.MainActivity
@@ -55,10 +52,6 @@ class BackgroundRecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeCameraId: String? = null
     private var cameraDevice: CameraDevice? = null
-    private var legacyCamera: Camera? = null
-    private var activeLegacyCameraId = 0
-    private var legacySurfaceTexture: SurfaceTexture? = null
-    private var legacySurface: Surface? = null
     private var captureSession: CameraCaptureSession? = null
     private var recorder: MediaRecorder? = null
     private var currentFile: File? = null
@@ -134,45 +127,24 @@ class BackgroundRecordingService : Service() {
         broadcastState(true, 0, null)
         acquireWakeLock()
         orientationTracker.start()
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
-            openLegacyCamera()
-        } else {
-            openCamera()
-        }
-    }
-
-    private fun openLegacyCamera() {
-        try {
-            activeLegacyCameraId = findLegacyBackCameraId()
-            legacyCamera = Camera.open(activeLegacyCameraId).also {
-                it.setDisplayOrientation(90)
-            }
-            startLegacySegment()
-        } catch (error: Exception) {
-            failAndStop("Background camera unavailable: ${error.message.orEmpty()}")
-        }
-    }
-
-    private fun findLegacyBackCameraId(): Int {
-        val info = Camera.CameraInfo()
-        for (id in 0 until Camera.getNumberOfCameras()) {
-            Camera.getCameraInfo(id, info)
-            if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK) return id
-        }
-        return 0
+        openCamera()
     }
 
     private fun openCamera() {
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = manager.cameraIdList.firstOrNull { id ->
-            manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
-                CameraCharacteristics.LENS_FACING_BACK
-        } ?: manager.cameraIdList.first()
-        activeCameraId = cameraId
-
         try {
+            val cameraIds = manager.cameraIdList
+            val cameraId = cameraIds.firstOrNull { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_BACK
+            } ?: cameraIds.first()
+            activeCameraId = cameraId
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (!continueRecording) {
+                        camera.close()
+                        return
+                    }
                     cameraDevice = camera
                     startSegment()
                 }
@@ -188,60 +160,13 @@ class BackgroundRecordingService : Service() {
                     camera.close()
                     failAndStop()
                 }
-            }, cameraHandler)
+            }, mainHandler)
         } catch (error: SecurityException) {
             Log.e(TAG, "Camera permission unavailable while starting background recording", error)
             failAndStop()
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
             Log.e(TAG, "Unable to open camera for background recording", error)
             failAndStop()
-        }
-    }
-
-    private fun startLegacySegment() {
-        val camera = legacyCamera ?: return failAndStop("Legacy camera unavailable")
-        val directory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "dashcam").apply { mkdirs() }
-
-        scope.launch {
-            if (!StoragePolicy.prepareForRecording(this@BackgroundRecordingService, directory)) {
-                mainHandler.post { failAndStop("Storage full, background recording stopped") }
-                return@launch
-            }
-
-            val startedAt = System.currentTimeMillis()
-            val filename = SimpleDateFormat("'dashcam_bg_'yyyyMMdd_HHmmss'.mp4'", Locale.US).format(Date(startedAt))
-            val file = File(directory, filename)
-            val recordingUuid = UUID.randomUUID().toString()
-            withContext(Dispatchers.Main.immediate) { orientationTracker.awaitReady() }
-
-            mainHandler.post {
-                if (!continueRecording || !remoteStartAllowed()) { failAndStop(); return@post }
-                try {
-                    currentFile = file
-                    currentRecordingUuid = recordingUuid
-                    segmentStartMs = startedAt
-                    segmentPlaybackRotationDegrees = null
-                    broadcastState(true, 0, file.name)
-                    recorder = createLegacyRecorder(file, camera).also {
-                        it.prepare()
-                        val info = Camera.CameraInfo().also { Camera.getCameraInfo(activeLegacyCameraId, it) }
-                        segmentPlaybackRotationDegrees = orientationTracker.recorderExtraRotation(
-                            info.orientation, info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT, 90
-                        )
-                        it.start()
-                    }
-                    locationTracker.start(recordingUuid, "video", GpsRecordingSettings.videoMode(this@BackgroundRecordingService))
-                    showStartAlertOnce()
-                    updateNotification("Background recording")
-                    mainHandler.removeCallbacks(statusRunnable)
-                    mainHandler.post(statusRunnable)
-                    mainHandler.removeCallbacks(rotateRunnable)
-                    VideoSegmentSettings.durationMilliseconds(this@BackgroundRecordingService)
-                        ?.let { mainHandler.postDelayed(rotateRunnable, it) }
-                } catch (error: Exception) {
-                    failAndStop("Unable to start background recording: ${error.message.orEmpty()}")
-                }
-            }
         }
     }
 
@@ -270,19 +195,31 @@ class BackgroundRecordingService : Service() {
                     segmentStartMs = startedAt
                     segmentPlaybackRotationDegrees = null
                     broadcastState(true, 0, file.name)
-                    recorder = createRecorder(file).also { it.prepare() }
-                    val recorderSurface = recorder!!.surface
+                    val segmentRecorder = createRecorder(file)
+                    recorder = segmentRecorder
+                    segmentRecorder.prepare()
+                    val recorderSurface = segmentRecorder.surface
                     val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                         addTarget(recorderSurface)
                     }
 
                     camera.createCaptureSession(listOf(recorderSurface), object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(session: CameraCaptureSession) {
-                            if (!continueRecording || !remoteStartAllowed()) { session.close(); failAndStop(); return }
+                            if (recorder !== segmentRecorder || !continueRecording) {
+                                session.close()
+                                return
+                            }
+                            if (!remoteStartAllowed()) { session.close(); failAndStop(); return }
                             captureSession = session
-                            session.setRepeatingRequest(request.build(), null, cameraHandler)
-                            segmentPlaybackRotationDegrees = capturePlaybackRotation()
-                            recorder?.start()
+                            try {
+                                session.setRepeatingRequest(request.build(), null, cameraHandler)
+                                segmentPlaybackRotationDegrees = capturePlaybackRotation()
+                                segmentRecorder.start()
+                            } catch (error: Exception) {
+                                Log.e(TAG, "Unable to start Camera2 background recording", error)
+                                failAndStop()
+                                return
+                            }
                             locationTracker.start(recordingUuid, "video", GpsRecordingSettings.videoMode(this@BackgroundRecordingService))
                             showStartAlertOnce()
                             updateNotification("Background recording")
@@ -294,10 +231,15 @@ class BackgroundRecordingService : Service() {
                         }
 
                         override fun onConfigureFailed(session: CameraCaptureSession) {
-                            failAndStop()
+                            session.close()
+                            if (recorder === segmentRecorder && continueRecording) {
+                                Log.e(TAG, "Unable to configure Camera2 recording session")
+                                failAndStop()
+                            }
                         }
-                    }, cameraHandler)
-                } catch (_: Exception) {
+                    }, mainHandler)
+                } catch (error: Exception) {
+                    Log.e(TAG, "Unable to prepare Camera2 background recording", error)
                     failAndStop()
                 }
             }
@@ -336,84 +278,6 @@ class BackgroundRecordingService : Service() {
             setVideoEncodingBitRate(profile.videoBitRate)
             setVideoFrameRate(profile.videoFrameRate)
             setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
-        }
-    }
-
-    private fun createLegacyRecorder(file: File, camera: Camera): MediaRecorder {
-        val profile = selectedCamcorderProfile()
-        val focusMode = configureLegacyFocus(camera)
-        legacySurfaceTexture?.release()
-        legacySurface?.release()
-        legacySurfaceTexture = SurfaceTexture(0).apply {
-            setDefaultBufferSize(profile.videoFrameWidth, profile.videoFrameHeight)
-        }
-        legacySurface = Surface(legacySurfaceTexture)
-
-        try {
-            camera.setPreviewTexture(legacySurfaceTexture)
-            camera.startPreview()
-            if (focusMode == Camera.Parameters.FOCUS_MODE_AUTO) {
-                camera.autoFocus { focused, _ ->
-                    Log.i(TAG, "Legacy background autofocus completed: focused=$focused")
-                }
-            }
-        } catch (error: Exception) {
-            Log.w(TAG, "Legacy background preview or autofocus failed", error)
-        }
-        camera.unlock()
-
-        return MediaRecorder().apply {
-            val canRecordAudio = ContextCompat.checkSelfPermission(
-                this@BackgroundRecordingService,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-            setCamera(camera)
-            if (canRecordAudio) {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-            }
-            setVideoSource(MediaRecorder.VideoSource.CAMERA)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setOutputFile(file.absolutePath)
-            if (canRecordAudio) {
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioEncodingBitRate(128_000)
-                setAudioSamplingRate(44_100)
-            }
-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            setOrientationHint(90)
-            setVideoEncodingBitRate(profile.videoBitRate)
-            setVideoFrameRate(profile.videoFrameRate)
-            setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
-            setPreviewDisplay(legacySurface)
-        }
-    }
-
-    private fun configureLegacyFocus(camera: Camera): String? {
-        return try {
-            val parameters = camera.parameters
-            val supportedModes = parameters.supportedFocusModes.orEmpty()
-            val defaultMode = parameters.focusMode
-            val selectedMode = when {
-                Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO in supportedModes ->
-                    Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
-                Camera.Parameters.FOCUS_MODE_AUTO in supportedModes ->
-                    Camera.Parameters.FOCUS_MODE_AUTO
-                else -> defaultMode
-            }
-            if (selectedMode != defaultMode) {
-                parameters.focusMode = selectedMode
-                camera.parameters = parameters
-            }
-            val activeMode = camera.parameters.focusMode
-            Log.i(
-                TAG,
-                "Legacy background focus: supported=$supportedModes, default=$defaultMode, " +
-                    "selected=$selectedMode, active=$activeMode"
-            )
-            activeMode
-        } catch (error: Exception) {
-            Log.w(TAG, "Unable to configure legacy background focus", error)
-            null
         }
     }
 
@@ -480,10 +344,6 @@ class BackgroundRecordingService : Service() {
         recorder?.reset()
         recorder?.release()
         recorder = null
-        try {
-            legacyCamera?.reconnect()
-        } catch (_: Exception) {
-        }
         currentFile = null
         currentRecordingUuid = null
 
@@ -522,7 +382,7 @@ class BackgroundRecordingService : Service() {
             stopAfterCurrentSegmentRequested && !powerAutoEnabled
         if (restart && continueRecording && powerAllowsNextSegment && !stopRequested) {
             stopAfterCurrentSegmentRequested = false
-            if (legacyCamera != null) startLegacySegment() else startSegment()
+            startSegment()
         } else {
             if (powerAutoEnabled && !powerAllowsNextSegment) {
                 Log.i(TAG, "Power unavailable at segment boundary; stopping background recording")
@@ -589,16 +449,6 @@ class BackgroundRecordingService : Service() {
         cameraDevice?.close()
         cameraDevice = null
         locationTracker.cancel()
-        try {
-            legacyCamera?.stopPreview()
-        } catch (_: Exception) {
-        }
-        legacyCamera?.release()
-        legacyCamera = null
-        legacySurface?.release()
-        legacySurface = null
-        legacySurfaceTexture?.release()
-        legacySurfaceTexture = null
         releaseWakeLock()
         stopForegroundCompat()
         PowerRecordingSettings.setBackgroundRecordingActive(this, false)
