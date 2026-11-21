@@ -10,7 +10,6 @@ const status = {
   deviceId, deviceName: 'Protocol test phone', manufacturer: 'Test', model: 'Test',
   androidVersion: 'test', appVersion: 'test', batteryLevel: 70, chargingSource: 'None',
   liveAccessEnabled: false, remoteControlEnabled: false,
-  backgroundVideoQuality: 'Balanced', videoSegmentMinutes: 5, startAlert: 'Silent',
   powerAutoBackgroundEnabled: true,
 }
 async function post(path, payload) {
@@ -29,10 +28,13 @@ let socket
 try {
   assert.equal((await post('/api/devices/heartbeat', status)).status, 200)
   assert.equal((await command(request)).status, 403, 'Default-deny for control permission')
+  assert.equal((await command({ action: 'set_mode', recordingMode: 'PowerAuto' })).status, 403)
   status.remoteControlEnabled = true
   await post('/api/devices/heartbeat', status)
   assert.equal((await command(request)).status, 409, 'No offline command queue')
-  assert.equal((await command({ action: 'start_audio' })).status, 409, 'Audio also has no offline command queue')
+  assert.equal((await command({ action: 'set_mode', recordingMode: 'PowerDiary' })).status, 409)
+  assert.equal((await command({ action: 'set_mode', recordingMode: 'invalid' })).status, 400)
+  assert.equal((await command({ action: 'start_audio', audioSegmentMinutes: 30 })).status, 409, 'Audio also has no offline command queue')
   assert.equal((await command({ ...request, segmentMinutes: -1 })).status, 400)
   assert.equal((await command({ ...request, segmentMinutes: 1.5 })).status, 400)
   assert.equal((await command({ ...request, quality: 'invalid' })).status, 400)
@@ -71,9 +73,10 @@ try {
   assert.equal(result.body.success, true)
   assert.equal(result.body.backgroundRecordingActive, true)
   const incomingAudio = nextCommand()
-  const audioPending = command({ action: 'start_audio' })
+  const audioPending = command({ action: 'start_audio', audioSegmentMinutes: 30 })
   const audioMessage = await incomingAudio
   assert.equal(audioMessage.action, 'start_audio')
+  assert.equal(audioMessage.audioSegmentMinutes, 30)
   socket.send(JSON.stringify({ type: 'recording_response', requestId: audioMessage.requestId,
     success: true, backgroundRecordingActive: false, audioRecordingActive: true,
     quality: 'Balanced', segmentMinutes: 5, startAlert: 'Silent' }))
@@ -86,6 +89,37 @@ try {
   socket.send(JSON.stringify({ type: 'recording_response', requestId: stopMessage.requestId,
     success: false, error: 'Control disabled on phone', backgroundRecordingActive: true }))
   assert.equal((await stopPending).body.success, false, 'Phone rejection must be reported, not treated as success')
+  const incomingMode = nextCommand()
+  const pendingMode = command({ action: 'set_mode', recordingMode: 'PowerDiary' })
+  const modeMessage = await incomingMode
+  assert.equal(modeMessage.action, 'set_mode')
+  assert.equal(modeMessage.recordingMode, 'PowerDiary')
+  assert.equal(modeMessage.quality, null, 'Mode requests do not need unrelated settings')
+  socket.send(JSON.stringify({ type: 'recording_response', requestId: modeMessage.requestId,
+    success: true, recordingMode: 'PowerDiary', powerDiaryActive: false }))
+  const modeResult = await pendingMode
+  assert.equal(modeResult.status, 200)
+  assert.equal(modeResult.body.recordingMode, 'PowerDiary')
+  assert.equal(modeResult.body.powerDiaryActive, false)
+  const incomingBlockedMode = nextCommand()
+  const pendingBlockedMode = command({ action: 'set_mode', recordingMode: 'Frontend' })
+  const blockedModeMessage = await incomingBlockedMode
+  socket.send(JSON.stringify({ type: 'recording_response', requestId: blockedModeMessage.requestId,
+    success: false, recordingMode: 'PowerDiary', powerDiaryActive: true, error: 'Stop Power-linked diary on the phone' }))
+  const blockedModeResult = await pendingBlockedMode
+  assert.equal(blockedModeResult.body.success, false)
+  assert.equal(blockedModeResult.body.recordingMode, 'PowerDiary', 'The phone remains authoritative')
+  assert.equal(blockedModeResult.body.powerDiaryActive, true)
+  const incomingSettings = nextCommand()
+  const pendingSettings = command({ action: 'get_settings' })
+  const settingsMessage = await incomingSettings
+  assert.equal(settingsMessage.action, 'get_settings')
+  socket.send(JSON.stringify({ type: 'recording_response', requestId: settingsMessage.requestId,
+    success: true, recordingMode: 'PowerDiary', powerDiaryActive: true,
+    quality: 'Balanced', segmentMinutes: 5, audioSegmentMinutes: 30, startAlert: 'Silent' }))
+  const settingsResult = await pendingSettings
+  assert.equal(settingsResult.body.quality, 'Balanced')
+  assert.equal(settingsResult.body.recordingMode, 'PowerDiary')
   status.remoteControlEnabled = false
   await post('/api/devices/heartbeat', status)
   assert.equal((await command(request)).status, 403, 'Revoked permission blocks commands even while connected')
@@ -97,9 +131,8 @@ try {
   assert.equal(device.onlineSource, 'websocket', 'Remote-only connection is online without Live Access')
   assert.equal(device.remoteControlEnabled, true)
   assert.equal(device.liveAccessEnabled, false)
-  assert.equal(device.backgroundVideoQuality, 'Balanced')
   assert.equal(device.powerAutoBackgroundEnabled, true)
-  console.log('PASS: permission, validation, offline rejection, concurrency, request IDs, phone acknowledgement and remote-only status')
+  console.log('PASS: permission, validation, offline rejection, concurrency, request IDs, phone acknowledgement, mode changes and remote-only status')
 } finally {
   socket?.close()
 }

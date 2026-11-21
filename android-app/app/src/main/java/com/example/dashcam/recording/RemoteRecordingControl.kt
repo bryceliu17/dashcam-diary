@@ -40,18 +40,24 @@ object RemoteRecordingControl {
             val remaining = message.optLong("expiresAt") - System.currentTimeMillis()
             check(remaining in 1..60_000L) { "Command expired. Check the phone clock and try again" }
             val action = message.optString("action")
-            check(action in listOf("get_settings", "start", "stop", "configure", "start_audio", "stop_audio", "configure_audio")) { "Unknown recording command" }
+            val mode = RecordingModeSettings.current(context)
+            check(action in listOf("get_settings", "set_mode", "start", "stop", "configure", "start_audio", "stop_audio", "configure_audio")) { "Unknown recording command" }
+            check(mode.allowsRemoteRecordingCommands || action !in listOf("start", "stop", "start_audio", "stop_audio")) {
+                "${mode.label} does not allow remote start or stop."
+            }
             val wasActive = PowerRecordingSettings.isBackgroundRecordingActive(context)
             if (action == "get_settings") {
                 // The response below reads the phone's current settings without changing them.
+            } else if (action == "set_mode") {
+                val requested = RecordingMode.entries.firstOrNull { it.name == message.optString("recordingMode") }
+                    ?: error("Invalid recording mode")
+                if (requested != mode) changeMode(context, requested)
             } else if (action == "stop") {
                 check(!PowerRecordingSettings.isVideoRecordingActive(context) || wasActive) {
                     "Stop foreground recording on the phone first"
                 }
                 if (wasActive) {
                     recordingError = null
-                    PowerRecordingSettings.setPowerAutoStartSuppressed(context,
-                        PowerRecordingSettings.isPowerAutoBackgroundEnabled(context) && PowerRecordingSettings.isDeviceCharging(context))
                     context.startService(Intent(context, BackgroundRecordingService::class.java)
                         .setAction(BackgroundRecordingService.ACTION_STOP))
                     check(withTimeoutOrNull(20_000L) {
@@ -122,7 +128,6 @@ object RemoteRecordingControl {
                     releasePreview?.invoke()
                     recorderStarted = false
                     recordingError = null
-                    PowerRecordingSettings.setPowerAutoStartSuppressed(context, false)
                     ContextCompat.startForegroundService(context,
                         Intent(context, BackgroundRecordingService::class.java)
                             .setAction(BackgroundRecordingService.ACTION_START)
@@ -145,6 +150,8 @@ object RemoteRecordingControl {
             .put("success", failureMessage == null).put("error", failureMessage ?: JSONObject.NULL)
             .put("backgroundRecordingActive", PowerRecordingSettings.isBackgroundRecordingActive(context))
             .put("audioRecordingActive", PowerRecordingSettings.isAudioRecordingActive(context))
+            .put("recordingMode", RecordingModeSettings.current(context).name)
+            .put("powerDiaryActive", PowerDiaryService.active)
             .put("quality", BackgroundVideoQualitySettings.quality(context).name)
             .put("segmentMinutes", VideoSegmentSettings.durationMinutes(context))
             .put("audioSegmentMinutes", AudioSegmentSettings.durationMinutes(context))
@@ -153,6 +160,24 @@ object RemoteRecordingControl {
                 replies[id] = it
                 while (replies.size > 32) replies.remove(replies.keys.first())
             }
+    }
+
+    private fun changeMode(context: Context, mode: RecordingMode) {
+        check(!PowerDiaryService.active && !PowerRecordingSettings.isAnyRecordingActive(context)) {
+            "Stop recording or stop Power-linked diary on the phone before changing modes."
+        }
+        check(!LiveAccessSettings.isStreaming(context)) { "Close live camera before changing modes." }
+        val connected = if (mode == RecordingMode.PowerAuto) {
+            check(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                "Grant camera permission in the phone app first."
+            }
+            val power = PowerMonitorService.isPowerConnected(context) ?: error("Unable to read the phone's power state.")
+            // Both commands run on the main thread. The service callback runs after the mode is saved.
+            PowerMonitorService.start(context)
+            power
+        } else null
+        RecordingModeSettings.select(context, mode, remotePowerConnected = connected)
+        context.sendBroadcast(Intent(RecordingModeSettings.ACTION_REMOTE_MODE_CHANGED).setPackage(context.packageName))
     }
 
     const val EXTRA_REMOTE_EXPIRES_AT = "remote_expires_at"

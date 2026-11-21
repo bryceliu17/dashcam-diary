@@ -25,7 +25,7 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
         if (!PowerRecordingSettings.isVolumeKeyStartEnabled(this) &&
-            !PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this)
+            !PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this) && !PowerDiaryService.isSelected(this)
         ) return false
 
         if (event.keyCode != KeyEvent.KEYCODE_VOLUME_UP) return false
@@ -44,6 +44,10 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
 
         if (isDoublePress) {
             lastVolumeUpTime = 0L
+            if (PowerDiaryService.isSelected(this)) {
+                PowerDiaryService.start(this)
+                return
+            }
             if (PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this)) {
                 startAudioRecording()
             } else {

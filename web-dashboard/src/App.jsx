@@ -2190,6 +2190,14 @@ function BatteryHistoryModal({ state, onRange, onClose }) {
   </div></div>
 }
 
+const remoteRecordingModes = {
+  Frontend: 'Frontend Recording',
+  PowerAuto: 'Power Auto Background',
+  VolumeVideoDoublePress: 'Volume Up Double-Press Video',
+  VolumeAudioDoublePress: 'Volume Up Double-Press Audio',
+  PowerDiary: 'Power-linked diary (audio / video)',
+}
+
 function RemoteRecordingPanel({ device, onClose, onUpdated }) {
   const [quality, setQuality] = useState('')
   const [minutes, setMinutes] = useState('')
@@ -2197,6 +2205,9 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
   const [videoCustom, setVideoCustom] = useState(false)
   const [audioCustom, setAudioCustom] = useState(false)
   const [alert, setAlert] = useState('')
+  const [currentMode, setCurrentMode] = useState('')
+  const [draftMode, setDraftMode] = useState('')
+  const [powerDiaryActive, setPowerDiaryActive] = useState(false)
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
   const [failed, setFailed] = useState(false)
@@ -2210,6 +2221,11 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
   const audioMinutesInput = useRef(null)
   const connected = device.online && device.onlineSource === 'websocket' && device.remoteControlEnabled
   const recording = device.videoRecordingActive || device.audioRecordingActive
+  const powerAuto = currentMode ? currentMode === 'PowerAuto' : device.powerAutoBackgroundEnabled
+  const automaticMode = powerAuto || currentMode === 'PowerDiary'
+  const modeDirty = draftMode !== currentMode
+  const modeChangeBlocked = !connected || !settingsReady || !currentMode || Boolean(busy) ||
+    recording || powerDiaryActive || device.liveStreaming || device.liveRequested
 
   const validSettings = result =>
     ['Balanced', 'High'].includes(result.quality) &&
@@ -2238,6 +2254,10 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
       setVideoCustom(![0, 1, 3, 5, 10, 15, 30].includes(result.segmentMinutes))
       setAudioCustom(![0, 5, 10, 15, 30, 60].includes(result.audioSegmentMinutes))
       setAlert(result.startAlert)
+      const mode = Object.hasOwn(remoteRecordingModes, result.recordingMode) ? result.recordingMode : ''
+      setCurrentMode(mode)
+      setDraftMode(mode)
+      setPowerDiaryActive(result.powerDiaryActive === true)
       setVideoDirty(false)
       setAudioDirty(false)
       setSettingsReady(true)
@@ -2255,12 +2275,18 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
       setSettingsReady(false)
       setSettingsLoading(false)
       setSettingsError('')
+      setCurrentMode('')
+      setDraftMode('')
+      setPowerDiaryActive(false)
     }
     return () => { settingsRequestId.current += 1 }
   }, [connected, loadSettings])
 
   const send = async action => {
     if (busy || !connected || (!settingsReady && action !== 'stop' && action !== 'stop_audio')) return
+    if (automaticMode && ['start', 'stop', 'start_audio', 'stop_audio'].includes(action)) return
+    const modeAction = action === 'set_mode'
+    if (modeAction && (modeChangeBlocked || !modeDirty || !Object.hasOwn(remoteRecordingModes, draftMode))) return
     const videoAction = action === 'start' || action === 'configure'
     const audioAction = action === 'start_audio' || action === 'configure_audio'
     if (videoAction && !validMinutes(minutes)) {
@@ -2273,12 +2299,19 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
     }
     setBusy(action)
     setFailed(false)
-    setMessage(action === 'stop' ? 'Saving the current video segment and stopping…' : action === 'stop_audio' ? 'Saving the current audio segment and stopping…' : action === 'start' ? 'Waiting for the phone to start video recording…' : action === 'start_audio' ? 'Waiting for the phone to start audio recording…' : action === 'configure_audio' ? 'Saving audio settings on the phone…' : 'Saving video settings on the phone…')
+    setMessage(modeAction ? 'Saving recording mode on the phone…' : action === 'stop' ? 'Saving the current video segment and stopping…' : action === 'stop_audio' ? 'Saving the current audio segment and stopping…' : action === 'start' ? 'Waiting for the phone to start video recording…' : action === 'start_audio' ? 'Waiting for the phone to start audio recording…' : action === 'configure_audio' ? 'Saving audio settings on the phone…' : 'Saving video settings on the phone…')
     try {
       const result = await api(`/api/devices/${encodeURIComponent(device.deviceId)}/recording`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, quality, segmentMinutes: Number(minutes), audioSegmentMinutes: Number(audioMinutes), startAlert: alert }),
+        body: JSON.stringify(modeAction ? { action, recordingMode: draftMode } : {
+          action, quality, segmentMinutes: Number(minutes), audioSegmentMinutes: Number(audioMinutes), startAlert: alert,
+        }),
       })
+      if (Object.hasOwn(remoteRecordingModes, result.recordingMode)) {
+        setCurrentMode(result.recordingMode)
+        if (modeAction && result.success || !modeDirty) setDraftMode(result.recordingMode)
+        setPowerDiaryActive(result.powerDiaryActive === true)
+      }
       if (!result.success) throw new Error(result.error || 'The phone could not complete this command.')
       onUpdated(device.deviceId, result)
       if (settingsReady && validSettings(result)) {
@@ -2291,7 +2324,7 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
       }
       if (videoAction) setVideoDirty(false)
       if (audioAction) setAudioDirty(false)
-      setMessage(action === 'stop' || action === 'stop_audio' ? 'Recording stopped. The current segment has been saved.' : action === 'start' || action === 'start_audio' ? 'The phone confirmed recording has started.' : action === 'configure_audio' ? 'Audio settings saved on the phone.' : 'Video settings saved on the phone.')
+      setMessage(modeAction ? 'Recording mode saved on the phone.' : action === 'stop' || action === 'stop_audio' ? 'Recording stopped. The current segment has been saved.' : action === 'start' || action === 'start_audio' ? 'The phone confirmed recording has started.' : action === 'configure_audio' ? 'Audio settings saved on the phone.' : 'Video settings saved on the phone.')
     } catch (error) { setMessage(error.message); setFailed(true) }
     finally { setBusy('') }
   }
@@ -2304,13 +2337,26 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
         {!device.remoteControlEnabled && <p>Turn on “Allow server control” in the phone app. Only the phone can grant this permission.</p>}
         {device.remoteControlEnabled && !connected && <p>The phone must reconnect before commands can be sent. Offline commands are not queued.</p>}
         {connected && <button type="button" className="remote-settings-refresh" disabled={settingsLoading || Boolean(busy)} onClick={() => {
-          if ((videoDirty || audioDirty) && !window.confirm('Discard unsaved changes and read settings from the phone again?')) return
+          if ((videoDirty || audioDirty || modeDirty) && !window.confirm('Discard unsaved changes and read settings from the phone again?')) return
           loadSettings()
         }}>Refresh phone settings</button>}
         {connected && settingsLoading && <p role="status">Reading current settings from the phone…</p>}
         {connected && settingsError && <p className="remote-command-error" role="alert">{settingsError}</p>}
-        {device.powerAutoBackgroundEnabled && !device.isCharging && <p className="remote-power-warning">Power Auto mode is on, but this phone is not charging. A remotely started video will stop after the current segment.</p>}
+        {powerAuto && <p className="remote-power-warning">Power Auto Background starts video on power connection and saves it after 15 seconds without power. Remote start and stop are disabled.</p>}
+        {currentMode === 'PowerDiary' && <p className="remote-power-warning">Start or stop Power-linked diary on the phone. Remote start and stop are disabled.</p>}
         <form onSubmit={event => event.preventDefault()}>
+          {settingsReady && currentMode && <>
+            <fieldset className="remote-recording-mode" disabled={modeChangeBlocked}>
+              <label>Recording mode<select value={draftMode} onChange={event => setDraftMode(event.target.value)}>
+                {Object.entries(remoteRecordingModes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select></label>
+              <button type="button" disabled={!modeDirty} onClick={() => send('set_mode')}>Save mode</button>
+            </fieldset>
+            {modeDirty && draftMode === 'PowerAuto' && <p>Selecting this mode remotely will wait for the next power connection before starting video.</p>}
+            {modeDirty && draftMode === 'PowerDiary' && <p>Saving selects this mode. Start it on the phone.</p>}
+            {powerDiaryActive && <p>Stop Power-linked diary on the phone, then refresh phone settings to change modes.</p>}
+          </>}
+          {settingsReady && !currentMode && <p>Update the phone app to change its recording mode here.</p>}
           {settingsReady && <fieldset disabled={!connected || Boolean(busy) || recording}>
             <label>Background video quality<select value={quality} onChange={event => { setQuality(event.target.value); setVideoDirty(true) }}>
               <option value="Balanced">Balanced · 720p</option><option value="High">High · 1080p (when supported)</option>
@@ -2333,10 +2379,10 @@ function RemoteRecordingPanel({ device, onClose, onUpdated }) {
           <div className="remote-recording-actions">
             <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording} onClick={() => send('configure')}>Save video + alert</button>
             <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording} onClick={() => send('configure_audio')}>Save audio length</button>
-            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested} onClick={() => send('start')}>Start video</button>
-            <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.backgroundRecordingActive} onClick={() => send('stop')}>Stop video & save</button>
-            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested} onClick={() => send('start_audio')}>Start audio</button>
-            <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.audioRecordingActive} onClick={() => send('stop_audio')}>Stop audio & save</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested || automaticMode} onClick={() => send('start')}>Start video</button>
+            <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.backgroundRecordingActive || automaticMode} onClick={() => send('stop')}>Stop video & save</button>
+            <button type="button" disabled={!connected || !settingsReady || Boolean(busy) || recording || device.liveStreaming || device.liveRequested || automaticMode} onClick={() => send('start_audio')}>Start audio</button>
+            <button type="button" className="danger" disabled={!connected || Boolean(busy) || !device.audioRecordingActive || automaticMode} onClick={() => send('stop_audio')}>Stop audio & save</button>
           </div>
           {(device.liveStreaming || device.liveRequested) && <p>Close live camera before starting video recording.</p>}
           {device.videoRecordingActive && !device.backgroundRecordingActive && <p>Foreground recording must be stopped on the phone.</p>}

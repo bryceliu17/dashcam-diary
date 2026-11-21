@@ -358,7 +358,12 @@ class LiveAccessService : Service() {
         }
     }
 
-    private fun startStreaming() {
+    private fun startStreaming(switchingCamera: Boolean = false) {
+        if (com.example.dashcam.recording.PowerDiaryService.active) {
+            liveRequested = false
+            setError("Power-linked diary is active. Stop the mode on the phone first.")
+            return
+        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             setError("Camera permission is required")
             return
@@ -371,13 +376,13 @@ class LiveAccessService : Service() {
         setError(null)
         broadcastState()
         val generation = cameraGeneration.incrementAndGet()
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            scheduleLegacyCameraStart(generation, switchingCamera)
+            return
+        }
         val startRunnable = Runnable cameraStart@{
             if (!isCurrentCameraRequest(generation)) return@cameraStart
             try {
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                    startLegacyStreaming(generation)
-                    return@cameraStart
-                }
                 val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
                 val targetLensFacing = if (requestedCameraFacing == CAMERA_FACING_FRONT) {
                     CameraCharacteristics.LENS_FACING_FRONT
@@ -420,19 +425,67 @@ class LiveAccessService : Service() {
             }
         }
         cameraStartRunnable = startRunnable
-        cameraHandler.postDelayed(startRunnable, cameraReleaseDelayMs())
+        cameraHandler.postDelayed(startRunnable, CAMERA_RELEASE_DELAY_MS)
     }
 
     private fun isCurrentCameraRequest(generation: Int): Boolean =
         generation == cameraGeneration.get() && liveRequested && streaming && cameraStarting
 
     @Suppress("DEPRECATION")
-    private fun startLegacyStreaming(generation: Int) {
-        val cameraId = findLegacyCameraId(requestedCameraFacing)
-            ?: return stopStreaming(cameraUnavailableMessage(requestedCameraFacing))
-        val camera = Camera.open(cameraId)
+    private fun scheduleLegacyCameraStart(generation: Int, switchingCamera: Boolean) {
+        val requestedAt = SystemClock.elapsedRealtime()
+        val cooldown = LegacyLiveCameraHandoff.RELEASE_DELAY_MS
+        val handoff = LegacyLiveCameraHandoff.shared
+        val initialDelay = handoff.initialDelayMs(requestedAt, switchingCamera)
+        val start = object : Runnable {
+            private var canRetry = initialDelay < cooldown
+
+            override fun run() {
+                if (!isCurrentCameraRequest(generation)) return
+                // Recheck in case a previous camera finished closing after we queued this open.
+                val releaseDelay = handoff.remainingReleaseDelayMs(SystemClock.elapsedRealtime())
+                if (releaseDelay > 0) {
+                    cameraHandler.postDelayed(this, releaseDelay)
+                    return
+                }
+                if (PowerRecordingSettings.isAnyRecordingActive(this@LiveAccessService) ||
+                    com.example.dashcam.recording.PowerDiaryService.active) {
+                    liveRequested = false
+                    stopStreaming("Phone is recording")
+                    return
+                }
+                try {
+                    val facing = requestedCameraFacing
+                    val cameraId = findLegacyCameraId(facing)
+                        ?: return stopStreaming(cameraUnavailableMessage(facing))
+                    val openStartedAt = SystemClock.elapsedRealtime()
+                    val camera = try {
+                        Camera.open(cameraId)
+                    } catch (error: RuntimeException) {
+                        if (!canRetry || error is SecurityException || !isCurrentCameraRequest(generation)) throw error
+                        canRetry = false
+                        Log.d(TAG, "Legacy live camera not ready; retrying once after camera cooldown")
+                        cameraHandler.postDelayed(this, cooldown)
+                        return
+                    }
+                    startLegacyStreaming(generation, camera, requestedAt, openStartedAt)
+                } catch (error: Exception) {
+                    if (generation == cameraGeneration.get()) {
+                        stopStreaming("Unable to open live camera: ${error.message.orEmpty()}")
+                    }
+                }
+            }
+        }
+        cameraStartRunnable = start
+        cameraHandler.postDelayed(start, initialDelay)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startLegacyStreaming(generation: Int, camera: Camera, requestedAt: Long, openStartedAt: Long) {
+        val openedAt = SystemClock.elapsedRealtime()
         if (!isCurrentCameraRequest(generation)) {
             camera.release()
+            LegacyLiveCameraHandoff.shared.cameraReleased(SystemClock.elapsedRealtime())
             return
         }
         legacyCamera = camera
@@ -460,6 +513,8 @@ class LiveAccessService : Service() {
         camera.setPreviewTexture(texture)
         val bufferSize = size.width * size.height * ImageFormat.getBitsPerPixel(ImageFormat.NV21) / 8
         repeat(2) { camera.addCallbackBuffer(ByteArray(bufferSize)) }
+        lastLegacyFrameAt = 0L
+        var firstUploadLogged = false
         camera.setPreviewCallbackWithBuffer { data, source ->
             if (generation != cameraGeneration.get() || !liveRequested || !streaming) {
                 return@setPreviewCallbackWithBuffer
@@ -488,11 +543,20 @@ class LiveAccessService : Service() {
                         LEGACY_JPEG_QUALITY,
                         output
                     )
-                    if (encoded && streaming) {
+                    if (encoded && streaming && generation == cameraGeneration.get()) {
+                        val uploadStartedAt = SystemClock.elapsedRealtime()
                         currentClient().uploadLiveFrame(
                             DeviceStatusReporter.deviceId(this@LiveAccessService),
                             output.toByteArray()
                         )
+                        if (!firstUploadLogged && generation == cameraGeneration.get()) {
+                            firstUploadLogged = true
+                            val sentAt = SystemClock.elapsedRealtime()
+                            Log.i(TAG, "Legacy live first frame: total=${sentAt - requestedAt}ms " +
+                                "beforeOpen=${openStartedAt - requestedAt}ms open=${openedAt - openStartedAt}ms " +
+                                "preview=${now - openedAt}ms encode=${uploadStartedAt - now}ms " +
+                                "upload=${sentAt - uploadStartedAt}ms")
+                        }
                     }
                 } catch (error: Exception) {
                     Log.d(TAG, "Legacy live frame upload deferred: ${error.message.orEmpty()}")
@@ -507,6 +571,7 @@ class LiveAccessService : Service() {
             legacySurfaceTexture = null
             texture.release()
             camera.release()
+            LegacyLiveCameraHandoff.shared.cameraReleased(SystemClock.elapsedRealtime())
             return
         }
         camera.startPreview()
@@ -517,6 +582,7 @@ class LiveAccessService : Service() {
             legacySurfaceTexture = null
             texture.release()
             camera.release()
+            LegacyLiveCameraHandoff.shared.cameraReleased(SystemClock.elapsedRealtime())
             return
         }
         cameraStarting = false
@@ -679,7 +745,7 @@ class LiveAccessService : Service() {
                     sendLiveCameraResponse(requestId, normalizedFacing, "Live camera was closed")
                     return@postDelayed
                 }
-                startStreaming()
+                startStreaming(switchingCamera = mustRestart)
                 sendLiveCameraResponse(requestId, normalizedFacing, null)
             }, if (mustRestart) cameraReleaseDelayMs() else 0L)
         }
@@ -780,6 +846,9 @@ class LiveAccessService : Service() {
     }
 
     private fun stopStreaming(error: String? = null) {
+        if (streaming || cameraStarting) {
+            LegacyLiveCameraHandoff.shared.cameraReleased(SystemClock.elapsedRealtime())
+        }
         cameraGeneration.incrementAndGet()
         cameraStarting = false
         streaming = false
@@ -797,7 +866,10 @@ class LiveAccessService : Service() {
                     legacyCamera?.stopPreview()
                 } catch (_: Exception) {
                 }
-                legacyCamera?.release()
+                legacyCamera?.let {
+                    it.release()
+                    LegacyLiveCameraHandoff.shared.cameraReleased(SystemClock.elapsedRealtime())
+                }
                 legacyCamera = null
                 legacySurfaceTexture?.release()
                 legacySurfaceTexture = null
@@ -923,7 +995,9 @@ class LiveAccessService : Service() {
     }
 
     private fun cameraReleaseDelayMs(): Long =
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) 900L else CAMERA_RELEASE_DELAY_MS
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            LegacyLiveCameraHandoff.RELEASE_DELAY_MS
+        } else CAMERA_RELEASE_DELAY_MS
 
     private fun broadcastState() {
         sendBroadcast(

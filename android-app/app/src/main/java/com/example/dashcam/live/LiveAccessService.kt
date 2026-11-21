@@ -34,6 +34,7 @@ import com.example.dashcam.network.ServerClient
 import com.example.dashcam.network.toJson
 import com.example.dashcam.recording.PowerRecordingSettings
 import com.example.dashcam.recording.RemoteRecordingControl
+import com.example.dashcam.recording.PowerDiaryService
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -354,6 +355,11 @@ class LiveAccessService : Service() {
     }
 
     private fun startStreaming() {
+        if (PowerDiaryService.active) {
+            liveRequested = false
+            setError("Power-linked diary is active. Stop the mode on the phone first.")
+            return
+        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             setError("Camera permission is required")
             return

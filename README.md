@@ -61,11 +61,16 @@ Recording timestamps are saved in UTC. The dashboard displays them in the browse
 | Mode | Behavior |
 |---|---|
 | `Frontend Recording` | Normal preview plus manual foreground/background recording controls. |
-| `Power Auto Background` | Starts background video when charging begins. When power disconnects, the active segment finishes before recording stops. |
+| `Power Auto Background` | Starts background video automatically on power connection; manual video start is disabled. After 15 continuous seconds without power, it stops and saves the current segment. You can stop it manually until the next power connection. |
 | `Volume Up Double-Press Video` | Double-press Volume Up within 700 ms to start background video. |
 | `Volume Up Double-Press Audio` | Double-press Volume Up within 700 ms to start audio recording. |
+| `Power-linked diary (audio / video)` | Select the mode, then press Start mode or double-press Volume Up. Records audio on battery; saves audio and switches to background video when power connects. After unplugging, video continues for 15 seconds before saving and returning to audio; reconnecting during that grace period keeps video running. Stop the whole mode in the app. Normal recording buttons and server start/stop commands are blocked in this mode. Each audio/video start follows Start Alert. |
+
+With **Allow server control** enabled, the web dashboard can read and change the phone's recording mode while it is idle. Remotely selecting **Power Auto Background** waits for the next power connection, even if the phone is already plugged in. Remotely selecting **Power-linked diary** does not start it. Both automatic modes reject remote start/stop commands.
 
 The volume-key modes require **Dashcam Volume Up Double-Press** to be enabled in Android Accessibility settings. Whether a fully screen-off phone delivers the key event depends on its firmware.
+
+If Android blocks starting camera or microphone services from the Volume Up shortcut while the app is in the background, open Dashcam Diary and use the Start button. Once the mode starts, power changes do not require reopening the app.
 
 Start alerts are configured independently of the recording mode. The choices are **Silent**, **Sound only**, **Screen only**, and **Sound + screen**. They apply to manual, power-triggered, and volume-key-triggered recording starts. A screen alert wakes the display briefly and shows “Recording started”.
 
@@ -310,11 +315,16 @@ React 管理页面（Docker 默认端口 8080）
 | 模式 | 行为 |
 |---|---|
 | `Frontend Recording` | 正常预览，以及手动前台/后台录像控制。 |
-| `Power Auto Background` | 开始充电时自动后台录像；断电后让当前分段录完再停止。 |
+| `Power Auto Background` | 接通电源时自动后台录像，不允许手动启动。连续断电 15 秒后停止并保存当前片段。也可手动停止，当次供电不会重新启动。 |
 | `Volume Up Double-Press Video` | 在 700 毫秒内双击音量加，开始后台录像。 |
 | `Volume Up Double-Press Audio` | 在 700 毫秒内双击音量加，开始音频录制。 |
+| `Power-linked diary (audio / video)` | 选中模式后，按启动按钮或双击音量加启用。未接电时录音，接电后保存录音并转为后台录像；断电持续 15 秒后保存视频并恢复录音，期间恢复供电则继续录像。整个模式只能在 App 中停止。此模式下普通录制按钮和服务端启停命令不可用，每次音视频启动遵循 Start Alert 设置。 |
+
+开启 **Allow server control** 后，网页可在手机空闲时读取和更改录制模式。远程选中 **Power Auto Background** 后，即使手机已经插电也要等下次接电才开始。远程选中 **Power-linked diary** 不会启动联动。两种自动模式均不接受远程启停命令。
 
 音量键模式需要在 Android 无障碍设置中启用 **Dashcam Volume Up Double-Press**。彻底熄屏时系统是否转发按键取决于手机固件。
+
+如果 Android 限制音量键从后台启动相机或麦克风，请打开 Dashcam Diary 用按钮启动联动模式。启动后，插拔电源切换不需要重新打开 App。
 
 启动提醒独立于录制模式，可选 **Silent**、**Sound only**、**Screen only** 和 **Sound + screen**。它适用于手动启动、插电启动和音量键启动；屏幕提醒会短暂唤醒屏幕并显示“Recording started”。
 

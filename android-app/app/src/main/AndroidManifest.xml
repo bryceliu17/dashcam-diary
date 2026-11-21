@@ -53,6 +53,10 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <service
+            android:name=".recording.PowerDiaryService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone|location" />
+        <service
             android:name=".recording.AudioRecordingService"
             android:exported="false"
             android:foregroundServiceType="microphone|location" />

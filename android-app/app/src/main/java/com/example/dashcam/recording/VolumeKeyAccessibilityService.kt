@@ -25,7 +25,8 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
         if (!PowerRecordingSettings.isVolumeKeyStartEnabled(this) &&
-            !PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this)
+            !PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this) &&
+            !PowerDiaryService.isSelected(this)
         ) return false
 
         if (event.keyCode != KeyEvent.KEYCODE_VOLUME_UP) return false
@@ -44,7 +45,18 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
 
         if (isDoublePress) {
             lastVolumeUpTime = 0L
-            if (PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this)) {
+            if (PowerDiaryService.isSelected(this)) {
+                if (!PowerDiaryService.hasPermissions(this)) {
+                    Toast.makeText(this, "Open Dashcam Diary to grant camera and microphone permissions", Toast.LENGTH_LONG).show()
+                    return
+                }
+                try {
+                    PowerDiaryService.start(this)
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Unable to start power-linked diary from volume shortcut", error)
+                    Toast.makeText(this, "Open Dashcam Diary to start this mode", Toast.LENGTH_LONG).show()
+                }
+            } else if (PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this)) {
                 startAudioRecording()
             } else {
                 startBackgroundRecording()

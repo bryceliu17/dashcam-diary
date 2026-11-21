@@ -28,6 +28,7 @@ import com.example.dashcam.MainActivity
 import com.example.dashcam.R
 import com.example.dashcam.data.DashcamDatabase
 import com.example.dashcam.data.VideoEntity
+import com.example.dashcam.live.LegacyLiveCameraHandoff
 import com.example.dashcam.location.GpsRecordingMode
 import com.example.dashcam.location.GpsRecordingSettings
 import com.example.dashcam.location.RecordingLocationTracker
@@ -60,7 +61,7 @@ class BackgroundRecordingService : Service() {
     private var segmentPlaybackRotationDegrees: Int? = null
     private val orientationTracker by lazy { RecordingOrientationTracker(this) }
     private var continueRecording = false
-    private var stopAfterCurrentSegmentRequested = false
+    private var savingSegment = false
     private var startAlertPending = false
     private var remoteStartExpiresAt = 0L
     private val locationTracker by lazy { RecordingLocationTracker(this) }
@@ -69,7 +70,7 @@ class BackgroundRecordingService : Service() {
         (RemoteRecordingControl.isEnabled(this) && System.currentTimeMillis() <= remoteStartExpiresAt)
 
     private val rotateRunnable = Runnable {
-        if (continueRecording) stopSegment(restart = !stopAfterCurrentSegmentRequested)
+        if (continueRecording) stopSegment(restart = true)
     }
     private val statusRunnable = object : Runnable {
         override fun run() {
@@ -88,6 +89,11 @@ class BackgroundRecordingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (PowerDiaryService.isSelected(this) && intent?.action != ACTION_QUERY_STATE &&
+            !PowerDiaryService.isManaged(intent)) {
+            if (!continueRecording && !savingSegment) stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (intent?.hasExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT) == true &&
             (!RemoteRecordingControl.isEnabled(this) ||
              System.currentTimeMillis() > intent.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0))) {
@@ -96,13 +102,40 @@ class BackgroundRecordingService : Service() {
             return START_NOT_STICKY
         }
         when (intent?.action) {
-            ACTION_STOP -> stopRecording()
-            ACTION_STOP_AFTER_SEGMENT -> stopAfterCurrentSegment()
+            ACTION_STOP -> {
+                if (PowerRecordingSettings.isPowerAutoBackgroundEnabled(this) && continueRecording) {
+                    PowerRecordingSettings.setPowerAutoStartSuppressed(this, true)
+                }
+                stopRecordingAndSaveCurrentSegment()
+            }
+            ACTION_STOP_ON_POWER_LOSS -> {
+                if (PowerRecordingSettings.isPowerAutoBackgroundEnabled(this) &&
+                    PowerMonitorService.isPowerConnected(this) == false) {
+                    stopRecordingAndSaveCurrentSegment()
+                } else if (!continueRecording && !savingSegment) {
+                    stopSelf(startId)
+                }
+            }
             ACTION_QUERY_STATE -> {
                 broadcastState(continueRecording, currentElapsedSeconds(), currentFile?.name)
-                if (!continueRecording) stopSelf(startId)
+                if (!continueRecording && !savingSegment) stopSelf(startId)
             }
             else -> {
+                val powerAuto = PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)
+                val automatic = intent?.action == ACTION_START_ON_POWER
+                if (powerAuto != automatic || (automatic &&
+                        (PowerRecordingSettings.isPowerAutoStartSuppressed(this) ||
+                            PowerMonitorService.isPowerConnected(this) != true ||
+                            PowerRecordingSettings.isAnyRecordingActive(this)))) {
+                    if (!continueRecording && !savingSegment) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            runCatching { startRecordingForeground("Background recording not started") }
+                        }
+                        finishService()
+                    }
+                    return START_NOT_STICKY
+                }
+                if (savingSegment) return START_NOT_STICKY
                 if (!continueRecording) remoteStartExpiresAt = intent?.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0) ?: 0
                 startRecording()
             }
@@ -120,7 +153,6 @@ class BackgroundRecordingService : Service() {
         }
 
         continueRecording = true
-        stopAfterCurrentSegmentRequested = false
         startAlertPending = true
         PowerRecordingSettings.setBackgroundRecordingActive(this, true)
         startRecordingForeground("Starting background recording")
@@ -348,6 +380,7 @@ class BackgroundRecordingService : Service() {
         currentRecordingUuid = null
 
         if (file != null && recordingUuid != null && file.exists() && file.length() > 0) {
+            savingSegment = true
             val endedAt = System.currentTimeMillis()
             val durationSeconds = ((endedAt - startedAt) / 1000).toInt().coerceAtLeast(1)
             broadcastState(restart && continueRecording, durationSeconds, file.name)
@@ -375,54 +408,23 @@ class BackgroundRecordingService : Service() {
     }
 
     private fun continueAfterSegment(restart: Boolean) {
-        val powerAutoEnabled = PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)
-        val powerAllowsNextSegment =
-            !powerAutoEnabled || PowerRecordingSettings.isDeviceCharging(this)
-        val stopRequested =
-            stopAfterCurrentSegmentRequested && !powerAutoEnabled
-        if (restart && continueRecording && powerAllowsNextSegment && !stopRequested) {
-            stopAfterCurrentSegmentRequested = false
+        savingSegment = false
+        if (restart && continueRecording) {
             startSegment()
         } else {
-            if (powerAutoEnabled && !powerAllowsNextSegment) {
-                Log.i(TAG, "Power unavailable at segment boundary; stopping background recording")
-            }
             finishService()
         }
-    }
-
-    private fun stopRecording() {
-        continueRecording = false
-        stopAfterCurrentSegmentRequested = false
-        if (recorder != null) stopSegment(restart = false) else finishService()
     }
 
     private fun stopRecordingAndSaveCurrentSegment() {
         continueRecording = false
-        stopAfterCurrentSegmentRequested = false
+        if (savingSegment) return
         if (recorder != null || currentFile != null) stopSegment(restart = false) else finishService()
     }
-
-    private fun stopAfterCurrentSegment() {
-        if (!continueRecording) {
-            finishService()
-            return
-        }
-        if (VideoSegmentSettings.durationMilliseconds(this) == null) {
-            stopRecordingAndSaveCurrentSegment()
-            return
-        }
-        stopAfterCurrentSegmentRequested = true
-        updateNotification("Stopping after current segment")
-        broadcastState(true, currentElapsedSeconds(), currentFile?.name)
-        if (recorder == null && currentFile == null) stopRecording()
-    }
-
     private fun failAndStop(message: String? = null) {
         RemoteRecordingControl.recordingError = message
             ?: "Recording failed. Check camera availability, permissions and storage"
         continueRecording = false
-        stopAfterCurrentSegmentRequested = false
         currentFile?.delete()
         locationTracker.cancel()
         broadcastState(false, 0, null, message)
@@ -446,7 +448,10 @@ class BackgroundRecordingService : Service() {
         recorder = null
         currentFile = null
         currentRecordingUuid = null
-        cameraDevice?.close()
+        cameraDevice?.let {
+            it.close()
+            LegacyLiveCameraHandoff.shared.cameraReleased(android.os.SystemClock.elapsedRealtime())
+        }
         cameraDevice = null
         locationTracker.cancel()
         releaseWakeLock()
@@ -465,10 +470,10 @@ class BackgroundRecordingService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             pendingIntentFlags()
         ))
-        .addAction(0, "Stop", PendingIntent.getService(
-            this, 1, Intent(this, BackgroundRecordingService::class.java).setAction(ACTION_STOP),
+        .apply { if (!PowerDiaryService.isSelected(this@BackgroundRecordingService)) addAction(0, "Stop", PendingIntent.getService(
+            this@BackgroundRecordingService, 1, Intent(this@BackgroundRecordingService, BackgroundRecordingService::class.java).setAction(ACTION_STOP),
             pendingIntentFlags()
-        ))
+        )) }
         .build()
 
     private fun updateNotification(text: String) {
@@ -536,7 +541,8 @@ class BackgroundRecordingService : Service() {
     companion object {
         const val ACTION_START = "com.example.dashcam.background.START"
         const val ACTION_STOP = "com.example.dashcam.background.STOP"
-        const val ACTION_STOP_AFTER_SEGMENT = "com.example.dashcam.background.STOP_AFTER_SEGMENT"
+        internal const val ACTION_START_ON_POWER = "com.example.dashcam.background.START_ON_POWER"
+        internal const val ACTION_STOP_ON_POWER_LOSS = "com.example.dashcam.background.STOP_ON_POWER_LOSS"
         const val ACTION_QUERY_STATE = "com.example.dashcam.background.QUERY_STATE"
         const val ACTION_STATE = "com.example.dashcam.background.STATE"
         const val EXTRA_ACTIVE = "active"

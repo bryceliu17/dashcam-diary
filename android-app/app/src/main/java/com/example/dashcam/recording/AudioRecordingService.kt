@@ -46,6 +46,8 @@ class AudioRecordingService : Service() {
     private var recordingUuid: String? = null
     private var segmentStartMs = 0L
     private var recordingActive = false
+    private var managedByPowerDiary = false
+    private var savingSegment = false
     private var startAlertPending = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var remoteStartExpiresAt = 0L
@@ -71,6 +73,11 @@ class AudioRecordingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val managed = PowerDiaryService.isManaged(intent)
+        if (intent?.action != ACTION_QUERY_STATE && PowerDiaryService.isSelected(this) != managed) {
+            if (!recordingActive && !savingSegment) stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (intent?.hasExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT) == true &&
             (!RemoteRecordingControl.isEnabled(this) ||
                 System.currentTimeMillis() > intent.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0))) {
@@ -82,10 +89,13 @@ class AudioRecordingService : Service() {
             ACTION_STOP -> stopRecording()
             ACTION_QUERY_STATE -> {
                 broadcastState(recordingActive, elapsedSeconds(), finalFile?.name)
-                if (!recordingActive) stopSelf(startId)
+                if (!recordingActive && !savingSegment) stopSelf(startId)
             }
             else -> {
+                if (managed && !PowerDiaryService.active) { stopSelf(startId); return START_NOT_STICKY }
+                if (savingSegment) return START_NOT_STICKY
                 if (!recordingActive) {
+                    managedByPowerDiary = managed
                     remoteStartExpiresAt = intent?.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0) ?: 0
                 }
                 startRecording()
@@ -103,7 +113,7 @@ class AudioRecordingService : Service() {
             finishService()
             return
         }
-        startRecordingForeground("Starting audio recording")
+        if (!managedByPowerDiary) startRecordingForeground("Starting audio recording")
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             RemoteRecordingControl.audioRecordingError = "Microphone permission is required"
             finishService("Microphone permission is required")
@@ -165,7 +175,7 @@ class AudioRecordingService : Service() {
                 startAlertPending = false
                 RecordingStartAlert.show(this, RecordingStartAlertType.Audio)
             }
-            updateNotification("Recording ${destination.name}")
+            if (!managedByPowerDiary) updateNotification("Recording ${destination.name}")
             broadcastState(true, 0, destination.name)
             mainHandler.removeCallbacks(rotateRunnable)
             AudioSegmentSettings.durationMilliseconds(this)
@@ -180,6 +190,10 @@ class AudioRecordingService : Service() {
     }
 
     private fun stopRecording() {
+        if (savingSegment) {
+            recordingActive = false
+            return
+        }
         if (!recordingActive) {
             finishService()
             return
@@ -212,8 +226,14 @@ class AudioRecordingService : Service() {
         } finally {
             try { currentRecorder?.release() } catch (_: RuntimeException) { }
         }
-        if (!saved) pending?.delete()
+        if (!saved) {
+            if (managedByPowerDiary && pending != null) {
+                RemoteRecordingControl.audioRecordingError = "Could not save audio. Check available storage."
+            }
+            pending?.delete()
+        }
         if (saved && destination != null && uuid != null) {
+            savingSegment = true
             serviceScope.launch {
                 val durationSeconds = ((endedAt - startedAt) / 1000L).toInt().coerceAtLeast(1)
                 DashcamDatabase.get(this@AudioRecordingService).audioDao().insert(
@@ -244,6 +264,7 @@ class AudioRecordingService : Service() {
     }
 
     private fun completeFinishedSegment(restart: Boolean, destination: File?, deletedCount: Int) {
+        savingSegment = false
         val savedMessage = destination?.let {
             if (deletedCount > 0) {
                 "Saved ${it.name}; overwritten $deletedCount old audio recording(s)"

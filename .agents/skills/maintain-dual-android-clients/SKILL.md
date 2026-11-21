@@ -1,33 +1,17 @@
 ---
 name: maintain-dual-android-clients
-description: Safely change, compare, or synchronize the current and Android 5-compatible clients in the dashcam repository while preserving each directory's platform-specific camera, dependency, and storage behavior.
+description: Change, compare, or port behavior between the current and Android 5-compatible clients in the Dashcam Diary repository without losing platform-specific behavior.
 ---
 
 # Maintain Both Android Clients
 
-Both maintained clients live on `main`:
+Use the maintained paths and branch rules in the repository's `AGENTS.md`. Compare only the relevant code paths, share the smallest behavior change, and verify each changed client with its own `gradlew.bat :app:assembleDebug` before reviewing the diff.
 
-- `android-app/`: API 26+, modern implementation.
-- `android-app-legacy/`: API 21+, Android 5-compatible implementation.
+## Platform boundaries
 
-The `android-5-compatible` branch is only a historical backup. Do not use it as the source for new development or deployment.
+- Keep both application IDs and shared database/API contracts compatible. Do not align dependency versions or SDK floors across clients as part of a feature port.
+- Both clients use CameraX for foreground video and Camera2 for background video. The current client's live camera and torch use Camera2; the legacy client's live camera and torch use `android.hardware.Camera` on API 21/22 and Camera2 on later versions. Check `recording/BackgroundRecordingService.kt` and `live/LiveAccessService.kt` for the actual paths.
+- In the legacy client, preserve the camera release delay, version-gated notification and service calls, UTC serialization, and network/upload workarounds. Guard APIs newer than 21.
+- Preserve the local video archive defaults in `StoragePolicy`: 25 GiB for the current client and 5.5 GiB for the legacy client. Defaults are not hard ceilings; keep support for the user's configured limit.
 
-## Workflow
-
-1. Confirm which client behavior the user wants changed. Shared product behavior normally applies to both directories.
-2. Compare the relevant implementations before editing; do not copy whole files across clients when platform-specific code is present.
-3. Port only the shared business behavior and retain the target client's compatibility implementation.
-4. Build every changed client with its own `gradlew.bat :app:assembleDebug` and inspect the final diff.
-
-## Invariants
-
-- Both clients keep `applicationId = "com.example.dashcam"` and compatible database/API payload contracts.
-- `android-app/` keeps `minSdk = 26`, its current dependency versions, CameraX foreground recording, and Camera2 background/live/torch implementation.
-- `android-app/` keeps `MAX_VIDEO_BYTES = 25L * 1024 * 1024 * 1024`.
-- `android-app-legacy/` keeps `minSdk = 21`, CameraX 1.3.4, WorkManager 2.9.1, and its pinned AndroidX/Lifecycle versions.
-- `android-app-legacy/` keeps `MAX_VIDEO_BYTES = 11L * 1024 * 1024 * 1024 / 2` (5.5 GiB).
-- Preserve its API 21/22 legacy `android.hardware.Camera` paths for background recording, live frames, and torch control through `Camera.Parameters.FLASH_MODE_TORCH`.
-- Preserve its release delay, version-gated notifications, `PendingIntent`/service fallbacks, `SimpleDateFormat` UTC serialization, and networking/upload compatibility workarounds.
-- Do not introduce unguarded APIs above API 21 into `android-app-legacy/`.
-- Cleanup deletes at most one oldest unlocked video per required check. If none can be deleted, do not start the next segment.
-- Server/dashboard changes belong to the shared main implementation and must not be duplicated inside either Android project.
+For video cleanup, distinguish the free-space trigger (one oldest unlocked video at the start of the check) from the configured archive limit (keep deleting the oldest unlocked video until below the limit). Do not start the next segment if a required deletion cannot be completed. Verify the current behavior in `recording/StoragePolicy.kt` before changing it.

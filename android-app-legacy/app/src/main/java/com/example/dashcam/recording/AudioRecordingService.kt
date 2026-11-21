@@ -72,6 +72,11 @@ class AudioRecordingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (PowerDiaryService.isSelected(this) && intent?.action != ACTION_QUERY_STATE &&
+            !PowerDiaryService.isManaged(intent)) {
+            if (!recordingActive) stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (intent?.hasExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT) == true &&
             (!RemoteRecordingControl.isEnabled(this) ||
                 System.currentTimeMillis() > intent.getLongExtra(RemoteRecordingControl.EXTRA_REMOTE_EXPIRES_AT, 0))) {
@@ -213,7 +218,12 @@ class AudioRecordingService : Service() {
         } finally {
             try { currentRecorder?.release() } catch (_: RuntimeException) { }
         }
-        if (!saved) pending?.delete()
+        if (!saved) {
+            if (PowerDiaryService.active) {
+                RemoteRecordingControl.audioRecordingError = "Unable to finalize audio segment. Check free storage."
+            }
+            pending?.delete()
+        }
         if (saved && destination != null && uuid != null) {
             serviceScope.launch {
                 val durationSeconds = ((endedAt - startedAt) / 1000L).toInt().coerceAtLeast(1)
@@ -319,13 +329,13 @@ class AudioRecordingService : Service() {
                 pendingIntentFlags()
             )
         )
-        .addAction(
+        .apply { if (!PowerDiaryService.isSelected(this@AudioRecordingService)) addAction(
             0, "Stop",
             PendingIntent.getService(
-                this, 1, Intent(this, AudioRecordingService::class.java).setAction(ACTION_STOP),
+                this@AudioRecordingService, 1, Intent(this@AudioRecordingService, AudioRecordingService::class.java).setAction(ACTION_STOP),
                 pendingIntentFlags()
             )
-        )
+        ) }
         .build()
 
     private fun updateNotification(text: String) {

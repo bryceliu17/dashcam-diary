@@ -64,6 +64,7 @@ import com.example.dashcam.data.UploadStatus
 import com.example.dashcam.data.VideoEntity
 import com.example.dashcam.live.LiveAccessService
 import com.example.dashcam.live.LiveAccessSettings
+import com.example.dashcam.live.LegacyLiveCameraHandoff
 import com.example.dashcam.location.GpsRecordingMode
 import com.example.dashcam.location.GpsRecordingSettings
 import com.example.dashcam.location.RecordingLocationTracker
@@ -73,6 +74,10 @@ import com.example.dashcam.recording.BackgroundRecordingService
 import com.example.dashcam.recording.BackgroundVideoQuality
 import com.example.dashcam.recording.BackgroundVideoQualitySettings
 import com.example.dashcam.recording.AudioRecordingService
+import com.example.dashcam.recording.POWER_DISCONNECT_GRACE_SECONDS
+import com.example.dashcam.recording.PowerDiaryService
+import com.example.dashcam.recording.RecordingMode
+import com.example.dashcam.recording.RecordingModeSettings
 import com.example.dashcam.recording.AudioSegmentSettings
 import com.example.dashcam.recording.AudioStoragePolicy
 import com.example.dashcam.recording.LockScreenRecordingIndicator
@@ -155,6 +160,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var audioRecordButton: Button
     private lateinit var liveAccessButton: Button
     private lateinit var recordingModeSpinner: Spinner
+    private lateinit var powerDiaryButton: Button
+    private lateinit var powerDiaryStatus: TextView
+    private val powerDiaryUiTick = object : Runnable {
+        override fun run() {
+            if (::powerDiaryButton.isInitialized) {
+                powerDiaryButton.visibility = if (PowerDiaryService.isSelected(this@MainActivity)) View.VISIBLE else View.GONE
+                powerDiaryButton.text = if (PowerDiaryService.active) "Stop power-linked diary" else "Start power-linked diary"
+                powerDiaryStatus.visibility = powerDiaryButton.visibility
+                powerDiaryStatus.text = PowerDiaryService.status
+                if (PowerDiaryService.isSelected(this@MainActivity)) {
+                    updateRecordingStatus()
+                    if (previewAvailable) updatePreviewAvailability()
+                }
+            }
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
     private lateinit var startAlertSpinner: Spinner
     private lateinit var backgroundVideoQualitySpinner: Spinner
     private lateinit var segmentDurationSpinner: Spinner
@@ -236,6 +258,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val powerDiaryPermissions = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions.values.all { it } && PowerDiaryService.isSelected(this)) {
+            updatePreviewAvailability()
+            mainHandler.postDelayed({
+                if (PowerDiaryService.isSelected(this)) PowerDiaryService.start(this)
+            }, backgroundCameraReleaseDelayMs())
+        } else toast("Camera and microphone permissions are required")
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -249,6 +282,23 @@ class MainActivity : ComponentActivity() {
             toast("Microphone permission denied; $mode recording will be silent")
         }
         pendingBackgroundStart = false
+    }
+
+    private val powerAutoPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) {
+            if (permissions[Manifest.permission.CAMERA] == true) PowerMonitorService.start(this)
+            else toast("Allow camera access in Android settings to use Power Auto Background")
+        }
+    }
+
+    private fun startPowerAutoMonitor() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            PowerMonitorService.start(this)
+        } else {
+            powerAutoPermissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+        }
     }
 
     private val audioPermissionLauncher = registerForActivityResult(
@@ -301,22 +351,10 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context?, intent: Intent?) { renderCharging(intent) }
     }
 
-    private val powerReceiver = object : BroadcastReceiver() {
+    private val remoteRecordingModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (!PowerRecordingSettings.isPowerAutoBackgroundEnabled(this@MainActivity)) return
-            when (intent?.action) {
-                Intent.ACTION_POWER_CONNECTED -> {
-                    if (!liveStreaming &&
-                        recording == null && !continueRecording && !backgroundRecordingActive &&
-                        !PowerRecordingSettings.isAnyRecordingActive(this@MainActivity)
-                    ) {
-                        startBackgroundDashcam()
-                    }
-                }
-                Intent.ACTION_POWER_DISCONNECTED -> {
-                    if (recording != null || continueRecording) requestStopAfterCurrentSegment()
-                }
-            }
+            updatePreviewAvailability()
+            updateRecordingStatus()
         }
     }
 
@@ -412,19 +450,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        LegacyLiveCameraHandoff.shared.previewHostStarted()
+        ContextCompat.registerReceiver(this, remoteRecordingModeReceiver,
+            IntentFilter(RecordingModeSettings.ACTION_REMOTE_MODE_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(this, stateReceiver, IntentFilter(RecordingService.ACTION_STATE), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(this, backgroundStateReceiver, IntentFilter(BackgroundRecordingService.ACTION_STATE), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(this, audioStateReceiver, IntentFilter(AudioRecordingService.ACTION_STATE), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(this, liveStateReceiver, IntentFilter(LiveAccessService.ACTION_STATE), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(this, batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
-        ContextCompat.registerReceiver(this, powerReceiver, IntentFilter().apply {
-            addAction(Intent.ACTION_POWER_CONNECTED)
-            addAction(Intent.ACTION_POWER_DISCONNECTED)
-        }, ContextCompat.RECEIVER_EXPORTED)
     }
 
     override fun onResume() {
         super.onResume()
+        mainHandler.removeCallbacks(powerDiaryUiTick)
+        mainHandler.post(powerDiaryUiTick)
         if (!showingVideoList && !showingVideoManager && !showingAudioList && !showingBatteryHistory) {
             refreshHomeStatus()
         } else {
@@ -434,12 +473,14 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        LegacyLiveCameraHandoff.shared.previewHostStopped(android.os.SystemClock.elapsedRealtime())
+        unregisterReceiver(remoteRecordingModeReceiver)
+        mainHandler.removeCallbacks(powerDiaryUiTick)
         try { unregisterReceiver(stateReceiver) } catch (_: IllegalArgumentException) { }
         try { unregisterReceiver(backgroundStateReceiver) } catch (_: IllegalArgumentException) { }
         try { unregisterReceiver(audioStateReceiver) } catch (_: IllegalArgumentException) { }
         try { unregisterReceiver(liveStateReceiver) } catch (_: IllegalArgumentException) { }
         try { unregisterReceiver(batteryReceiver) } catch (_: IllegalArgumentException) { }
-        try { unregisterReceiver(powerReceiver) } catch (_: IllegalArgumentException) { }
         RecordingService.previewSurfaceProvider = null
         stopAudioPlayback()
         super.onStop()
@@ -691,6 +732,30 @@ class MainActivity : ComponentActivity() {
             }
         }
         root.addView(recordingModeSpinner, LinearLayout.LayoutParams(-1, dp(52)))
+        powerDiaryButton = actionButton("Start power-linked diary") {
+            if (PowerDiaryService.active) {
+                PowerDiaryService.stop(this)
+            } else if (PowerRecordingSettings.isAnyRecordingActive(this) || liveStreaming) {
+                toast("Stop current recording or Live streaming first")
+            } else if (listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).any {
+                    ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+                }) {
+                powerDiaryPermissions.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+            } else {
+                updatePreviewAvailability()
+                mainHandler.postDelayed({
+                    if (PowerDiaryService.isSelected(this)) PowerDiaryService.start(this)
+                }, backgroundCameraReleaseDelayMs())
+            }
+        }
+        root.addView(powerDiaryButton, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) })
+        powerDiaryStatus = TextView(this).apply {
+            textSize = 13f
+            text = "Battery: audio. Power connected: video. Unplug: audio after $POWER_DISCONNECT_GRACE_SECONDS seconds. Open app to stop."
+        }
+        root.addView(powerDiaryStatus)
+        powerDiaryButton.visibility = if (PowerDiaryService.isSelected(this)) View.VISIBLE else View.GONE
+        powerDiaryStatus.visibility = powerDiaryButton.visibility
         root.addView(TextView(this).apply {
             text = "Start Alert"
             textSize = 12f
@@ -1827,6 +1892,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestStart() {
+        if (PowerDiaryService.isSelected(this)) { toast("Use Start power-linked diary instead"); return }
         if (liveStreaming) {
             toast("Stop Live streaming first")
             return
@@ -1855,6 +1921,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestBackgroundStart() {
+        if (PowerDiaryService.isSelected(this) || PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) return
         if (liveStreaming) {
             toast("Stop Live streaming first")
             return
@@ -1879,6 +1946,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startBackgroundDashcam() {
+        if (PowerDiaryService.isSelected(this) || PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) return
         if (liveStreaming) {
             toast("Stop Live streaming first")
             return
@@ -1891,7 +1959,6 @@ class MainActivity : ComponentActivity() {
             toast("Stop Dashcam Diary recording first")
             return
         }
-        PowerRecordingSettings.setPowerAutoStartSuppressed(this, false)
         backgroundRecordingActive = true
         PowerRecordingSettings.setBackgroundRecordingActive(this, true)
         updatePreviewAvailability()
@@ -1918,10 +1985,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopBackgroundDashcam() {
-        val suppressUntilPowerCycle =
-            PowerRecordingSettings.isPowerAutoBackgroundEnabled(this) &&
-                PowerRecordingSettings.isDeviceCharging(this)
-        PowerRecordingSettings.setPowerAutoStartSuppressed(this, suppressUntilPowerCycle)
         startService(Intent(this, BackgroundRecordingService::class.java).setAction(BackgroundRecordingService.ACTION_STOP))
         updatePreviewAvailability()
         updateBackgroundRecordButton()
@@ -1951,6 +2014,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startAudioRecording() {
+        if (PowerDiaryService.isSelected(this)) return
         if (liveStreaming) {
             toast("Stop Live streaming first")
             return
@@ -1977,63 +2041,24 @@ class MainActivity : ComponentActivity() {
         toast("Stopping and saving current audio segment")
     }
 
-    private fun requestStopAfterCurrentSegment() {
-        var handled = false
-        val unlimitedSegment = VideoSegmentSettings.durationMilliseconds(this) == null
-        if (recording != null || continueRecording) {
-            if (unlimitedSegment) {
-                stopDashcam("Power disconnected")
-            } else {
-                stopAfterCurrentSegment = true
-                updateRecordingStatus()
-            }
-            handled = true
-        }
-        if (backgroundRecordingActive) {
-            startService(
-                Intent(this, BackgroundRecordingService::class.java)
-                    .setAction(BackgroundRecordingService.ACTION_STOP_AFTER_SEGMENT)
-            )
-            handled = true
-        }
-        if (handled) {
-            toast(
-                if (unlimitedSegment) "Power disconnected; stopping and saving current video"
-                else "Power disconnected; stopping after current segment"
-            )
-        }
-    }
-
     private fun setRecordingMode(mode: RecordingMode) {
-        when (mode) {
-            RecordingMode.Frontend -> {
-                PowerRecordingSettings.setPowerAutoBackgroundEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyStartEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyAudioStartEnabled(this, false)
-                PowerMonitorService.stop(this)
-            }
-            RecordingMode.PowerAuto -> {
-                PowerRecordingSettings.setVolumeKeyStartEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyAudioStartEnabled(this, false)
-                PowerRecordingSettings.setPowerAutoBackgroundEnabled(this, true)
-                PowerMonitorService.start(this)
-            }
-            RecordingMode.VolumeVideoDoublePress -> {
-                PowerRecordingSettings.setPowerAutoBackgroundEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyAudioStartEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyStartEnabled(this, true)
-                PowerMonitorService.stop(this)
-            }
-            RecordingMode.VolumeAudioDoublePress -> {
-                PowerRecordingSettings.setPowerAutoBackgroundEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyStartEnabled(this, false)
-                PowerRecordingSettings.setVolumeKeyAudioStartEnabled(this, true)
-                PowerMonitorService.stop(this)
-            }
+        if ((mode == RecordingMode.PowerAuto || currentRecordingMode() == RecordingMode.PowerAuto) &&
+            (recording != null || continueRecording || backgroundRecordingActive ||
+                PowerRecordingSettings.isVideoRecordingActive(this))) {
+            toast("Stop video recording before changing the recording mode")
+            updateModeButtons()
+            return
         }
+        if (PowerDiaryService.active || PowerRecordingSettings.isAnyRecordingActive(this) || recording != null || continueRecording) {
+            toast("Stop the current recording or mode before changing modes")
+            updateModeButtons()
+            return
+        }
+        RecordingModeSettings.select(this, mode)
         updateModeButtons()
         updatePreviewAvailability()
         updateRecordingStatus()
+        if (mode == RecordingMode.PowerAuto) startPowerAutoMonitor()
         if (mode == RecordingMode.VolumeAudioDoublePress &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -2043,7 +2068,7 @@ class MainActivity : ComponentActivity() {
             audioPermissionLauncher.launch(permissions.toTypedArray())
             return
         }
-        if ((mode == RecordingMode.VolumeVideoDoublePress || mode == RecordingMode.VolumeAudioDoublePress) &&
+        if ((mode == RecordingMode.VolumeVideoDoublePress || mode == RecordingMode.VolumeAudioDoublePress || mode == RecordingMode.PowerDiary) &&
             !isVolumeKeyAccessibilityEnabled()
         ) {
             toast("Enable Dashcam Diary Volume Up Double-Press in Accessibility settings")
@@ -2055,7 +2080,7 @@ class MainActivity : ComponentActivity() {
 
     private fun updateModeButtons() {
         if (::recordingModeSpinner.isInitialized) {
-            recordingModeSpinner.isEnabled = !liveStreaming
+            recordingModeSpinner.isEnabled = !liveStreaming && !PowerDiaryService.active
             val position = currentRecordingMode().ordinal
             if (recordingModeSpinner.selectedItemPosition != position) {
                 recordingModeSpinner.setSelection(position, false)
@@ -2335,12 +2360,7 @@ class MainActivity : ComponentActivity() {
         return if (preset >= 0) preset else CUSTOM_AUDIO_DURATION_POSITION
     }
 
-    private fun currentRecordingMode(): RecordingMode = when {
-        PowerRecordingSettings.isPowerAutoBackgroundEnabled(this) -> RecordingMode.PowerAuto
-        PowerRecordingSettings.isVolumeKeyStartEnabled(this) -> RecordingMode.VolumeVideoDoublePress
-        PowerRecordingSettings.isVolumeKeyAudioStartEnabled(this) -> RecordingMode.VolumeAudioDoublePress
-        else -> RecordingMode.Frontend
-    }
+    private fun currentRecordingMode(): RecordingMode = RecordingModeSettings.current(this)
 
     private fun isVolumeKeyAccessibilityEnabled(): Boolean {
         val expected = ComponentName(this, VolumeKeyAccessibilityService::class.java).flattenToString()
@@ -2353,10 +2373,16 @@ class MainActivity : ComponentActivity() {
 
     private fun updateBackgroundRecordButton() {
         if (::backgroundRecordButton.isInitialized) {
-            backgroundRecordButton.text = if (backgroundRecordingActive) "Stop Background Video" else "Start Background Video"
-            backgroundRecordButton.isEnabled = !liveStreaming && (
+            val powerAuto = PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)
+            backgroundRecordButton.text = when {
+                backgroundRecordingActive -> "Stop Background Video"
+                powerAuto && PowerRecordingSettings.isPowerAutoStartSuppressed(this) -> "Reconnect Power to Start Video"
+                powerAuto -> "Connect Power to Start Video"
+                else -> "Start Background Video"
+            }
+            backgroundRecordButton.isEnabled = !PowerDiaryService.isSelected(this) && !liveStreaming && (
                 backgroundRecordingActive ||
-                    (recording == null && !continueRecording && !audioRecordingActive)
+                    (!powerAuto && recording == null && !continueRecording && !audioRecordingActive)
                 )
         }
     }
@@ -2402,6 +2428,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startDashcam() {
+        if (PowerDiaryService.isSelected(this) || PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) return
         if (audioRecordingActive || PowerRecordingSettings.isAudioRecordingActive(this)) {
             toast("Stop audio recording first")
             return
@@ -2439,6 +2466,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startPreviewOnly() {
+        if (PowerDiaryService.isSelected(this)) return
         if (!::previewView.isInitialized ||
             recording != null ||
             continueRecording ||
@@ -2448,7 +2476,7 @@ class MainActivity : ComponentActivity() {
             PowerRecordingSettings.isBackgroundRecordingActive(this)
         ) return
         ensureCameraProvider {
-            if (recording != null ||
+            if (PowerDiaryService.isSelected(this) || recording != null ||
                 continueRecording ||
                 backgroundRecordingActive ||
                 PowerRecordingSettings.isPowerAutoBackgroundEnabled(this) ||
@@ -2467,7 +2495,7 @@ class MainActivity : ComponentActivity() {
         val powerAutoEnabled = PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)
         val backgroundActive = backgroundRecordingActive || PowerRecordingSettings.isBackgroundRecordingActive(this)
         val volumeKeyStartEnabled = PowerRecordingSettings.isVolumeKeyStartEnabled(this)
-        if (powerAutoEnabled || volumeKeyStartEnabled || backgroundActive || liveStreaming) {
+        if (PowerDiaryService.isSelected(this) || powerAutoEnabled || volumeKeyStartEnabled || backgroundActive || liveStreaming) {
             previewAvailable = false
             exitPreviewFullscreen()
             RecordingService.previewSurfaceProvider = null
@@ -2997,7 +3025,7 @@ class MainActivity : ComponentActivity() {
         }
         if (::audioRecordButton.isInitialized) {
             audioRecordButton.text = if (audioRecordingActive) "Stop Audio" else "Start Audio"
-            audioRecordButton.isEnabled = !liveStreaming && (
+            audioRecordButton.isEnabled = !PowerDiaryService.isSelected(this) && !liveStreaming && (
                 audioRecordingActive ||
                     (recording == null && !continueRecording && !backgroundRecordingActive)
                 )
@@ -3033,7 +3061,7 @@ class MainActivity : ComponentActivity() {
         }
         if (::previewRecordButton.isInitialized) {
             previewRecordButton.text = if (active) "Stop Video" else "Start Video"
-            previewRecordButton.isEnabled = !liveStreaming && (
+            previewRecordButton.isEnabled = !PowerDiaryService.isSelected(this) && !liveStreaming && (
                 active ||
                     (!backgroundRecordingActive &&
                         !audioRecordingActive &&
@@ -3184,13 +3212,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private data class SegmentDurationChoice(val label: String, val minutes: Int?)
-
-    private enum class RecordingMode(val label: String) {
-        Frontend("Frontend Recording"),
-        PowerAuto("Power Auto Background"),
-        VolumeVideoDoublePress("Volume Up Double-Press Video"),
-        VolumeAudioDoublePress("Volume Up Double-Press Audio")
-    }
 
     private data class AudioFileInfo(
         val file: File,

@@ -1,5 +1,6 @@
 package com.example.dashcam.recording
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.ActivityManager
 import android.app.NotificationManager
@@ -9,20 +10,28 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.dashcam.MainActivity
 import com.example.dashcam.R
+import com.example.dashcam.live.LiveAccessSettings
 
 class PowerMonitorService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastChargingState: Boolean? = null
     private var monitoring = false
+    private val disconnectGrace = PowerAutoDisconnectGrace()
+    private var disconnectWakeLock: PowerManager.WakeLock? = null
+    private val disconnectStopRunnable = Runnable { stopIfStillDisconnected() }
     private val batteryPollRunnable = object : Runnable {
         override fun run() {
             pollPowerState()
@@ -34,7 +43,7 @@ class PowerMonitorService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (!PowerRecordingSettings.isPowerAutoBackgroundEnabled(this@PowerMonitorService)) return
             when (intent?.action) {
-                Intent.ACTION_POWER_CONNECTED -> handlePowerConnected(newConnection = true)
+                Intent.ACTION_POWER_CONNECTED -> handlePowerConnected(newConnection = lastChargingState != true)
                 Intent.ACTION_POWER_DISCONNECTED -> handlePowerDisconnected()
             }
         }
@@ -56,9 +65,6 @@ class PowerMonitorService : Service() {
         }
 
         startForeground(NOTIFICATION_ID, buildNotification())
-        if (!isBackgroundRecordingServiceRunning()) {
-            PowerRecordingSettings.setBackgroundRecordingActive(this, false)
-        }
         startMonitoring()
         return START_STICKY
     }
@@ -66,58 +72,92 @@ class PowerMonitorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun handlePowerConnected(newConnection: Boolean) {
+        cancelDisconnectStop()
         lastChargingState = true
-        PowerRecordingSettings.setLastKnownChargingState(this, true)
-        if (!PowerRecordingSettings.isDeviceCharging(this)) return
+        if (PowerRecordingSettings.lastKnownChargingState(this) != true) {
+            PowerRecordingSettings.setLastKnownChargingState(this, true)
+        }
         if (newConnection) PowerRecordingSettings.setPowerAutoStartSuppressed(this, false)
         if (PowerRecordingSettings.isPowerAutoStartSuppressed(this)) return
-        if (PowerRecordingSettings.isAnyRecordingActive(this)) return
+        if (PowerRecordingSettings.isAnyRecordingActive(this) || LiveAccessSettings.isStreaming(this)) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         try {
             Log.i(TAG, "Power connected while monitoring; starting background recording")
             ContextCompat.startForegroundService(
                 this,
                 Intent(this, BackgroundRecordingService::class.java)
-                    .setAction(BackgroundRecordingService.ACTION_START)
+                    .setAction(BackgroundRecordingService.ACTION_START_ON_POWER)
             )
-            PowerRecordingSettings.setBackgroundRecordingActive(this, true)
         } catch (error: RuntimeException) {
-            PowerRecordingSettings.setBackgroundRecordingActive(this, false)
             Log.e(TAG, "Unable to start background recording from power monitor", error)
         }
     }
 
     private fun handlePowerDisconnected() {
         lastChargingState = false
-        PowerRecordingSettings.setLastKnownChargingState(this, false)
-        PowerRecordingSettings.setPowerAutoStartSuppressed(this, false)
-        if (PowerRecordingSettings.isDeviceCharging(this)) return
+        if (PowerRecordingSettings.lastKnownChargingState(this) != false) {
+            PowerRecordingSettings.setLastKnownChargingState(this, false)
+        }
         if (!PowerRecordingSettings.isBackgroundRecordingActive(this)) return
+        val now = SystemClock.elapsedRealtime()
+        if (disconnectGrace.remainingMs(now) != null) return
+        disconnectGrace.onDisconnected(now)
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        disconnectWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:PowerAutoStop").apply {
+            setReferenceCounted(false)
+            acquire(POWER_DISCONNECT_GRACE_MS + 2_000L)
+        }
+        mainHandler.postDelayed(disconnectStopRunnable, POWER_DISCONNECT_GRACE_MS)
+    }
+
+    private fun stopIfStillDisconnected() {
+        val remaining = disconnectGrace.remainingMs(SystemClock.elapsedRealtime()) ?: return
+        if (remaining > 0) {
+            mainHandler.postDelayed(disconnectStopRunnable, remaining)
+            return
+        }
         try {
-            Log.i(TAG, "Power disconnected while monitoring; stopping after current segment")
-            ContextCompat.startForegroundService(
-                this,
+            if (!PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) return
+            if (isPowerConnected(this) != false || !PowerRecordingSettings.isBackgroundRecordingActive(this)) return
+            Log.i(TAG, "Power disconnected for $POWER_DISCONNECT_GRACE_SECONDS seconds; stopping and saving background video")
+            startService(
                 Intent(this, BackgroundRecordingService::class.java)
-                    .setAction(BackgroundRecordingService.ACTION_STOP_AFTER_SEGMENT)
+                    .setAction(BackgroundRecordingService.ACTION_STOP_ON_POWER_LOSS)
             )
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Unable to request background stop after current segment", error)
+            Log.e(TAG, "Unable to stop background video after power loss", error)
+        } finally {
+            cancelDisconnectStop()
         }
     }
 
+    private fun cancelDisconnectStop() {
+        disconnectGrace.cancel()
+        mainHandler.removeCallbacks(disconnectStopRunnable)
+        disconnectWakeLock?.let { if (it.isHeld) it.release() }
+        disconnectWakeLock = null
+    }
+
     private fun startMonitoring() {
+        lastChargingState = PowerRecordingSettings.lastKnownChargingState(this)
         if (monitoring) {
             pollPowerState()
             return
         }
-        lastChargingState = PowerRecordingSettings.lastKnownChargingState(this)
+        if (!isBackgroundRecordingServiceRunning()) {
+            PowerRecordingSettings.setBackgroundRecordingActive(this, false)
+        }
         monitoring = true
         pollPowerState()
+        // Recover the stop timer if the monitor was restarted with a recording still active.
+        if (lastChargingState == false) handlePowerDisconnected()
         mainHandler.postDelayed(batteryPollRunnable, POLL_INTERVAL_MS)
         Log.i(TAG, "Power monitor polling started, charging=$lastChargingState")
     }
 
     private fun pollPowerState() {
-        val charging = PowerRecordingSettings.isDeviceCharging(this)
+        if (!PowerRecordingSettings.isPowerAutoBackgroundEnabled(this)) return
+        val charging = isPowerConnected(this) ?: return
         val previous = lastChargingState
         if (charging) {
             val newConnection = previous == false
@@ -132,10 +172,9 @@ class PowerMonitorService : Service() {
         } else if (previous == true) {
             Log.i(TAG, "Power disconnected detected by polling")
             handlePowerDisconnected()
-        } else {
-            PowerRecordingSettings.setLastKnownChargingState(this, false)
+        } else if (previous == null) {
+            handlePowerDisconnected()
         }
-        lastChargingState = charging
     }
 
     private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -168,6 +207,7 @@ class PowerMonitorService : Service() {
     override fun onDestroy() {
         monitoring = false
         mainHandler.removeCallbacks(batteryPollRunnable)
+        cancelDisconnectStop()
         try { unregisterReceiver(powerReceiver) } catch (_: IllegalArgumentException) { }
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -181,6 +221,10 @@ class PowerMonitorService : Service() {
         private const val POLL_INTERVAL_MS = 10_000L
         private const val TAG = "PowerMonitorService"
 
+        internal fun isPowerConnected(context: Context): Boolean? =
+            context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                ?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)?.let { it != 0 }
+
         fun start(context: Context) {
             ContextCompat.startForegroundService(
                 context.applicationContext,
@@ -189,8 +233,8 @@ class PowerMonitorService : Service() {
         }
 
         fun stop(context: Context) {
-            context.applicationContext.startService(
-                Intent(context.applicationContext, PowerMonitorService::class.java).setAction(ACTION_STOP)
+            context.applicationContext.stopService(
+                Intent(context.applicationContext, PowerMonitorService::class.java)
             )
         }
     }
